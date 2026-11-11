@@ -20,12 +20,27 @@
 #include <QThread>
 #include <optional>
 
+// One translated line and where it sits on the frame: rect is normalized
+// 0..1 in FULL-FRAME coordinates (the worker maps the OCR block's
+// crop-relative rect through the job's sourceRect), so the overlay can draw
+// the Vietnamese box exactly over the English line it replaces.
+struct TranslatedBlock
+{
+    QString original;
+    QString translated;
+    QRectF rect;
+};
+Q_DECLARE_METATYPE(TranslatedBlock)
+
 struct TranslationJob
 {
     QImage crop;            // detached dialogue crop; empty for direct-text jobs
     QString cropHash;       // SHA-256 of the crop; lets the engine cache by pixels
     QRectF sourceRect;      // normalized dialogue rect the crop came from
     QString directText;     // when non-empty, OCR is skipped and this is translated
+    bool testJob = false;   // true for the Settings "Dịch thử" button: the
+                            // result updates the TEST section only and must
+                            // never show on the live stream overlay
     QString ocrEngineId = QStringLiteral("gemini-vision");
     QString providerId = QStringLiteral("google");
     QString sourceLanguage = QStringLiteral("en");
@@ -39,6 +54,10 @@ struct TranslationJobResult
     bool ok = false;
     QString original;   // OCR'd (or direct) English text
     QString translated; // Vietnamese text on success
+    // One translated block per OCR'd line, in reading order. Empty for
+    // direct-text jobs that carry no OCR coordinates.
+    QList<TranslatedBlock> blocks;
+    bool testJob = false; // mirrors the job: TEST results stay off the overlay
     QRectF sourceRect;
     qint64 ocrMs = 0;
     qint64 translateMs = 0;
@@ -47,6 +66,11 @@ struct TranslationJobResult
     QString error;      // safe to show; never contains a key
 };
 Q_DECLARE_METATYPE(TranslationJobResult)
+
+// Maps an OCR block's rect (normalized 0..1 within the crop) into
+// full-frame normalized coordinates through the crop's sourceRect.
+// Pure and unit-testable; results are clamped to the frame.
+QRectF mapBlockRectToFrame(const QRectF &blockRect, const QRectF &sourceRect);
 
 // Pure queue logic: 1 running + 1 waiting, newest waiting job wins.
 // No threads, no network — this is what the unit test exercises.

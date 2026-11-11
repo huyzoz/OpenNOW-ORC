@@ -19,16 +19,33 @@
 //    classic Win32 executable, so the API cannot be activated.
 #pragma once
 
+#include <QList>
+#include <QRectF>
 #include <QString>
 #include <memory>
 
 class QImage;
+
+// One line of recognized text and where it sits in the recognized image.
+// rect is normalized 0..1 within the image (x, y, w, h). The overlay draws
+// one translated box per block, exactly over the English line — that is
+// what "translate over the original text" means; a single box over the
+// whole dialogue area is not it.
+struct OcrBlock
+{
+    QString text;
+    QRectF rect;
+};
+Q_DECLARE_METATYPE(OcrBlock)
 
 struct OcrResult
 {
     enum class Status { Ok, NotAvailable, Failed };
     Status status = Status::Failed;
     QString text;       // English dialogue text, "" when none found
+    // One block per line, in reading order. text is the blocks joined
+    // with "\n" (kept for callers that only need the flat text).
+    QList<OcrBlock> blocks;
     double confidence = -1.0; // 0..1, or -1 when the engine reports none
     QString error;      // human-readable, safe to show; never contains a key
 };

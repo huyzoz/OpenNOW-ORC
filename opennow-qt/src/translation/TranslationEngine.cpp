@@ -7,6 +7,7 @@
 #include <QMetaObject>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QVariant>
 
 namespace {
 constexpr int KeepPreviousMs = 2000;
@@ -15,6 +16,12 @@ constexpr int KeepPreviousMs = 2000;
 // and OCR would never run. Full-screen mode throttles instead: at most
 // one OCR job per interval, newest frame wins.
 constexpr int FullScreenIntervalMs = 2000;
+// Frame pump: one screenshot request per interval while translation is
+// enabled. The native runtime fulfills a request on the next presented
+// frame, so a 1s pump feeds the engine ~1 frame per second — enough for
+// the stability gate (400ms) and the full-screen throttle (2s) — for the
+// cost of one texture readback per second.
+constexpr int FramePumpIntervalMs = 1000;
 
 bool isFullScreenRect(const QRectF &rect)
 {
@@ -76,6 +83,8 @@ TranslationEngine::TranslationEngine(QObject *parent)
     connect(&m_stabilityTimer, &QTimer::timeout, this, &TranslationEngine::onStabilityTimeout);
     m_keepPreviousTimer.setSingleShot(true);
     connect(&m_keepPreviousTimer, &QTimer::timeout, this, &TranslationEngine::onKeepPreviousExpired);
+    m_frameTimer.setInterval(FramePumpIntervalMs);
+    connect(&m_frameTimer, &QTimer::timeout, this, &TranslationEngine::onFrameTimerTimeout);
 
     connect(m_worker, &TranslationWorker::jobCompleted,
             this, &TranslationEngine::onWorkerJobCompleted);
@@ -138,6 +147,12 @@ TranslationEngine::TranslationEngine(QObject *parent)
         m_stabilityDelayMs = qBound(0, m_stabilityDelayMs, 5000);
         m_fontSizePx = qBound(10, m_fontSizePx, 64);
     }
+    // The pump was restored enabled from QSettings: start it. The
+    // frameRequested connect in ApplicationStartup is wired after this
+    // constructor returns, and the first timeout is 1s away, so no
+    // request is ever emitted before the connect exists.
+    if (m_enabled)
+        m_frameTimer.start();
     setStatus(QStringLiteral("Translation ready"));
 }
 
@@ -184,9 +199,12 @@ void TranslationEngine::setEnabled(bool enabled)
     saveTranslationSetting(QStringLiteral("enabled"), enabled);
     if (!m_enabled) {
         m_stabilityTimer.stop();
+        m_frameTimer.stop();
         m_pendingHash.clear();
         m_pendingCrop = QImage();
         m_worker->cancelPending();
+    } else {
+        m_frameTimer.start();
     }
     setStatus(m_enabled ? QStringLiteral("Translation enabled")
                         : QStringLiteral("Translation disabled"));
@@ -315,10 +333,11 @@ void TranslationEngine::setDialoguePreset(const QString &preset)
         emit dialoguePresetChanged();
     }
     setDialogueRect(rect);
-    // An in-place box over the whole frame would hide the game: show the
-    // full-screen translation as a subtitle bar instead.
-    if (preset == QStringLiteral("full-screen") && m_overlayMode == QStringLiteral("inplace"))
-        setOverlayMode(QStringLiteral("subtitle"));
+    // NOTE: full-screen used to force overlayMode to "subtitle" here
+    // because one in-place box over the whole frame would hide the game.
+    // With per-line blocks the in-place mode draws one small box per
+    // English line instead, so full-screen + inplace now works and the
+    // forced switch is gone (v2).
 }
 
 void TranslationEngine::setGeminiApiKey(const QString &key)
@@ -398,7 +417,7 @@ void TranslationEngine::submitCrop(const QImage &crop, const QString &hash, cons
     if (m_cacheEnabled) {
         const auto hit = m_hashCache.constFind(hash);
         if (hit != m_hashCache.constEnd()) {
-            emitTranslation(hit->first, hit->second, rect, 0, 0, true);
+            emitTranslation(hit->original, hit->translated, rect, 0, 0, true, hit->blocks);
             return;
         }
     }
@@ -441,15 +460,14 @@ void TranslationEngine::requestTestTranslation(const QString &englishText)
     if (m_cacheEnabled) {
         QString cached;
         if (m_dialogueDb.lookup(text, cached) || m_cache.lookup(text, cached)) {
-            m_lastCacheHit = true;
-            m_lastOcrMs = 0;
-            m_lastTranslateMs = 0;
-            emitTranslation(text, cached, m_dialogueRect, 0, 0, true);
+            // TEST result only: it must never reach the live overlay.
+            setTestResult(text, cached, 0, 0, true);
             return;
         }
     }
     TranslationJob job;
     job.directText = text;
+    job.testJob = true;
     job.sourceRect = m_dialogueRect;
     job.providerId = m_translationProvider;
     job.sourceLanguage = m_sourceLanguage;
@@ -464,10 +482,21 @@ void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)
 {
     if (!result.ok) {
         setError(result.error.isEmpty() ? QStringLiteral("Translation failed") : result.error);
+        // A failed TEST job only shows in the TEST section: never touch
+        // the live overlay for it.
+        if (result.testJob)
+            return;
         // Keep the previous translation visible for 2s, then clear it.
         // Never emit garbage text.
         if (m_hasTranslation)
             m_keepPreviousTimer.start(KeepPreviousMs);
+        return;
+    }
+    if (result.testJob) {
+        // TEST-section only: the Settings page shows it, the stream
+        // overlay never sees it.
+        setTestResult(result.original, result.translated,
+                      result.ocrMs, result.translateMs, result.cacheHit);
         return;
     }
     if (result.original.isEmpty() && result.translated.isEmpty()) {
@@ -483,14 +512,17 @@ void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)
         if (!result.cropHash.isEmpty()) {
             if (!m_hashCache.contains(result.cropHash))
                 m_hashOrder.append(result.cropHash);
-            m_hashCache.insert(result.cropHash, {result.original, result.translated});
+            m_hashCache.insert(result.cropHash,
+                               HashCacheEntry{result.original, result.translated,
+                                              blocksToVariantList(result.blocks)});
             while (m_hashCache.size() > MaxHashCacheEntries && !m_hashOrder.isEmpty())
                 m_hashCache.remove(m_hashOrder.takeFirst());
         }
     }
     m_lastCacheHit = false;
     emitTranslation(result.original, result.translated, result.sourceRect,
-                    result.ocrMs, result.translateMs, false);
+                    result.ocrMs, result.translateMs, false,
+                    blocksToVariantList(result.blocks));
 }
 
 void TranslationEngine::onKeepPreviousExpired()
@@ -498,9 +530,39 @@ void TranslationEngine::onKeepPreviousExpired()
     clearTranslation();
 }
 
+void TranslationEngine::onFrameTimerTimeout()
+{
+    if (m_enabled)
+        emit frameRequested();
+}
+
+QVariantList TranslationEngine::blocksToVariantList(const QList<TranslatedBlock> &blocks)
+{
+    QVariantList list;
+    list.reserve(blocks.size());
+    for (const TranslatedBlock &block : blocks) {
+        QVariantMap map;
+        map.insert(QStringLiteral("original"), block.original);
+        map.insert(QStringLiteral("translated"), block.translated);
+        map.insert(QStringLiteral("x"), block.rect.x());
+        map.insert(QStringLiteral("y"), block.rect.y());
+        map.insert(QStringLiteral("w"), block.rect.width());
+        map.insert(QStringLiteral("h"), block.rect.height());
+        list.append(map);
+    }
+    return list;
+}
+
+QVariantList TranslationEngine::singleBlockVariantList(const QString &original,
+                                                      const QString &translated,
+                                                      const QRectF &rect)
+{
+    return blocksToVariantList({TranslatedBlock{original, translated, rect}});
+}
+
 void TranslationEngine::emitTranslation(const QString &original, const QString &translated,
                                         const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
-                                        bool cacheHit)
+                                        bool cacheHit, const QVariantList &blocks)
 {
     m_lastOriginalText = original;
     m_lastTranslatedText = translated;
@@ -508,13 +570,30 @@ void TranslationEngine::emitTranslation(const QString &original, const QString &
     m_lastTranslateMs = translateMs;
     m_lastCacheHit = cacheHit;
     m_lastError.clear();
+    m_translationBlocks = blocks.isEmpty()
+        ? singleBlockVariantList(original, translated, sourceRect)
+        : blocks;
     if (!m_hasTranslation) {
         m_hasTranslation = true;
         emit hasTranslationChanged();
     }
     setStatus(QStringLiteral("Translation ready"));
+    emit translationBlocksChanged();
     emit translationTextChanged();
     emit translationReady(original, translated, sourceRect);
+}
+
+void TranslationEngine::setTestResult(const QString &original, const QString &translated,
+                                      qint64 ocrMs, qint64 translateMs, bool cacheHit)
+{
+    m_lastOriginalText = original;
+    m_lastTranslatedText = translated;
+    m_lastOcrMs = ocrMs;
+    m_lastTranslateMs = translateMs;
+    m_lastCacheHit = cacheHit;
+    m_lastError.clear();
+    setStatus(QStringLiteral("Translation ready"));
+    emit translationTextChanged();
 }
 
 void TranslationEngine::clearTranslation()
@@ -523,8 +602,10 @@ void TranslationEngine::clearTranslation()
         return;
     m_lastTranslatedText.clear();
     m_lastOriginalText.clear();
+    m_translationBlocks.clear();
     m_hasTranslation = false;
     emit hasTranslationChanged();
+    emit translationBlocksChanged();
     emit translationTextChanged();
     emit translationCleared();
 }

@@ -66,6 +66,15 @@ void TranslationJobQueue::clearWaiting()
     m_waiting.reset();
 }
 
+QRectF mapBlockRectToFrame(const QRectF &blockRect, const QRectF &sourceRect)
+{
+    const double x = qBound(0.0, sourceRect.x() + blockRect.x() * sourceRect.width(), 1.0);
+    const double y = qBound(0.0, sourceRect.y() + blockRect.y() * sourceRect.height(), 1.0);
+    const double w = qBound(0.0, blockRect.width() * sourceRect.width(), 1.0 - x);
+    const double h = qBound(0.0, blockRect.height() * sourceRect.height(), 1.0 - y);
+    return QRectF(x, y, w, h);
+}
+
 // ---------------------------------------------------------------------------
 // TranslationWorker
 // ---------------------------------------------------------------------------
@@ -75,6 +84,7 @@ TranslationWorker::TranslationWorker(QObject *parent)
 {
     qRegisterMetaType<TranslationJob>();
     qRegisterMetaType<TranslationJobResult>();
+    qRegisterMetaType<TranslatedBlock>();
 }
 
 TranslationWorker::~TranslationWorker()
@@ -147,8 +157,10 @@ void TranslationWorker::processNext()
     TranslationJobResult result;
     result.sourceRect = job->sourceRect;
     result.cropHash = job->cropHash;
+    result.testJob = job->testJob; // set once here: every return below keeps it
 
     QString original;
+    QList<OcrBlock> ocrBlocks;
     qint64 ocrMs = 0;
     if (!job->directText.isEmpty()) {
         original = job->directText;
@@ -202,6 +214,7 @@ void TranslationWorker::processNext()
             return;
         }
         original = ocr.text.trimmed();
+        ocrBlocks = ocr.blocks;
         if (original.isEmpty()) {
             // No dialogue text in this crop: not an error, just nothing to
             // translate. Report success with empty text so the engine can
@@ -231,15 +244,77 @@ void TranslationWorker::processNext()
         QMetaObject::invokeMethod(this, "processNext", Qt::QueuedConnection);
         return;
     }
+    // One network call for the whole crop: translate the blocks joined
+    // with "\n" (the free Google endpoint preserves line breaks), then
+    // split the reply back onto the same blocks. If the reply has a
+    // different number of lines, fall back to one call per block — the
+    // position mapping must never be guessed from a misaligned split.
     const TranslateResult translated =
         provider->translate(original, job->sourceLanguage, job->targetLanguage);
     result.translateMs = translateTimer.elapsed();
     result.ocrMs = ocrMs;
     if (!translated.ok) {
         result.error = translated.error;
-    } else {
+    } else if (ocrBlocks.isEmpty()) {
+        // Direct-text job (or an OCR engine that gave flat text only):
+        // one block covering the whole crop.
         result.ok = true;
         result.translated = translated.text;
+        result.blocks.append(TranslatedBlock{original, translated.text,
+                                             mapBlockRectToFrame(QRectF(0, 0, 1, 1),
+                                                                 job->sourceRect)});
+    } else {
+        QStringList lines = translated.text.split(QChar(u'\n'));
+        while (!lines.isEmpty() && lines.last().isEmpty())
+            lines.removeLast();
+        for (QString &line : lines)
+            line = line.trimmed();
+        if (lines.size() == ocrBlocks.size()) {
+            result.ok = true;
+            result.translated = lines.join(QChar(u'\n'));
+            for (int i = 0; i < ocrBlocks.size(); ++i) {
+                // Never cover an English line with an empty box: a line
+                // that translated to nothing is left untranslated (and
+                // visible) instead of hidden behind an empty box.
+                if (lines.at(i).isEmpty())
+                    continue;
+                result.blocks.append(TranslatedBlock{
+                    ocrBlocks.at(i).text, lines.at(i),
+                    mapBlockRectToFrame(ocrBlocks.at(i).rect, job->sourceRect)});
+            }
+            if (result.blocks.isEmpty()) {
+                // Every line translated to nothing: report "no text" so
+                // the engine leaves the current translation alone.
+                result.original.clear();
+                result.translated.clear();
+            }
+        } else {
+            // Line count mismatch: translate each block on its own.
+            QStringList perBlock;
+            QString lastError;
+            for (const OcrBlock &block : ocrBlocks) {
+                const TranslateResult one =
+                    provider->translate(block.text, job->sourceLanguage, job->targetLanguage);
+                if (!one.ok) {
+                    lastError = one.error;
+                    continue;
+                }
+                const QString oneText = one.text.trimmed();
+                if (oneText.isEmpty())
+                    continue;
+                perBlock.append(oneText);
+                result.blocks.append(TranslatedBlock{
+                    block.text, oneText,
+                    mapBlockRectToFrame(block.rect, job->sourceRect)});
+            }
+            if (result.blocks.isEmpty()) {
+                result.error = lastError.isEmpty() ? QStringLiteral("Translation failed")
+                                                   : lastError;
+            } else {
+                result.ok = true;
+                result.translated = perBlock.join(QChar(u'\n'));
+            }
+        }
     }
 
     m_queue.finishRunning();

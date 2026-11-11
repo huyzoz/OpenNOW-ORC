@@ -7,17 +7,25 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QList>
+#include <QMap>
 #include <QProcess>
 #include <QStandardPaths>
 
 namespace {
 constexpr auto GeminiModel = "gemini-2.5-flash-lite";
+// The model must return one block PER LINE, with the block's position in
+// the image — the overlay draws one Vietnamese box over each English line,
+// so coordinates are the whole point. x/y/w/h are fractions of the image
+// (0.0-1.0). If the model ignores the shape and returns the old {"text"}
+// form, parseGeminiOcrText wraps it as one whole-image block.
 constexpr auto GeminiOcrPrompt =
     "Extract all English text visible in this image (dialogue, subtitles, menus, labels), "
-    "line by line, in reading order. "
-    "Reply with JSON only, no other text: {\"text\": \"...\", \"confidence\": 0.0}. "
-    "confidence is 0.0-1.0 for how sure you are the text is correct. "
-    "If no English text is visible, reply {\"text\": \"\", \"confidence\": 0}.";
+    "one block per line of text, in reading order. "
+    "Reply with JSON only, no other text: {\"blocks\": [{\"text\": \"...\", \"x\": 0.0, \"y\": 0.0, "
+    "\"w\": 0.0, \"h\": 0.0}], \"confidence\": 0.0}. "
+    "x, y, w, h are the block's position and size as fractions of the image (0.0-1.0). "
+    "If no English text is visible, reply {\"blocks\": [], \"confidence\": 0}.";
 
 QString geminiUrl()
 {
@@ -27,7 +35,11 @@ QString geminiUrl()
 
 // Parses the model's JSON reply out of the Gemini response envelope.
 // Strips ```json fences if the model added them despite the prompt.
-bool parseGeminiOcrText(const QByteArray &body, QString &text, double &confidence, QString &error)
+// Fills text (blocks joined with "\n") and blocks (one per line, rect
+// normalized 0..1 within the image, clamped and empty/zero-area blocks
+// dropped). Accepts the old {"text": ...} shape as one whole-image block.
+bool parseGeminiOcrText(const QByteArray &body, QString &text, QList<OcrBlock> &blocks,
+                        double &confidence, QString &error)
 {
     const QJsonDocument doc = QJsonDocument::fromJson(body);
     if (!doc.isObject()) {
@@ -60,8 +72,36 @@ bool parseGeminiOcrText(const QByteArray &body, QString &text, double &confidenc
         error = QStringLiteral("OCR service returned unparsable text");
         return false;
     }
-    text = inner.object().value(QStringLiteral("text")).toString().trimmed();
-    confidence = inner.object().value(QStringLiteral("confidence")).toDouble(-1.0);
+    const QJsonObject obj = inner.object();
+    confidence = obj.value(QStringLiteral("confidence")).toDouble(-1.0);
+    blocks.clear();
+    const QJsonArray blockArray = obj.value(QStringLiteral("blocks")).toArray();
+    for (const QJsonValue &value : blockArray) {
+        const QJsonObject block = value.toObject();
+        const QString blockText = block.value(QStringLiteral("text")).toString().trimmed();
+        if (blockText.isEmpty())
+            continue;
+        const double x = qBound(0.0, block.value(QStringLiteral("x")).toDouble(0.0), 1.0);
+        const double y = qBound(0.0, block.value(QStringLiteral("y")).toDouble(0.0), 1.0);
+        const double w = qBound(0.0, block.value(QStringLiteral("w")).toDouble(0.0), 1.0 - x);
+        const double h = qBound(0.0, block.value(QStringLiteral("h")).toDouble(0.0), 1.0 - y);
+        if (w <= 0.0 || h <= 0.0)
+            continue;
+        blocks.append(OcrBlock{blockText, QRectF(x, y, w, h)});
+    }
+    if (blocks.isEmpty()) {
+        // Old shape (or a model that ignored the blocks instruction):
+        // one block covering the whole image, so the overlay still shows
+        // the text instead of dropping the whole OCR result.
+        const QString flat = obj.value(QStringLiteral("text")).toString().trimmed();
+        if (!flat.isEmpty())
+            blocks.append(OcrBlock{flat, QRectF(0, 0, 1, 1)});
+    }
+    QStringList lines;
+    lines.reserve(blocks.size());
+    for (const OcrBlock &block : blocks)
+        lines.append(block.text);
+    text = lines.join(QChar(u'\n'));
     return true;
 }
 } // namespace
@@ -79,10 +119,10 @@ void GeminiVisionOcrEngine::setApiKey(const QString &apiKey)
 OcrResult GeminiVisionOcrEngine::recognize(const QImage &image)
 {
     if (m_apiKey.isEmpty())
-        return OcrResult{OcrResult::Status::NotAvailable, {}, -1.0,
+        return OcrResult{OcrResult::Status::NotAvailable, {}, {}, -1.0,
                          QStringLiteral("Gemini API key not set")};
     if (image.isNull() || image.width() <= 0 || image.height() <= 0)
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0,
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
                          QStringLiteral("Empty image passed to OCR")};
 
     QByteArray jpeg;
@@ -91,7 +131,7 @@ OcrResult GeminiVisionOcrEngine::recognize(const QImage &image)
         buffer.open(QIODevice::WriteOnly);
         // JPEG quality 90: small payload, text stays legible.
         if (!image.convertedTo(QImage::Format_RGB32).save(&buffer, "JPG", 90))
-            return OcrResult{OcrResult::Status::Failed, {}, -1.0,
+            return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
                              QStringLiteral("Could not encode image for OCR")};
     }
 
@@ -114,14 +154,15 @@ OcrResult GeminiVisionOcrEngine::recognize(const QImage &image)
         geminiUrl(), payload,
         {{QByteArrayLiteral("x-goog-api-key"), m_apiKey.toUtf8()}});
     if (!result.ok())
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0, result.error};
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, result.error};
 
     QString text;
+    QList<OcrBlock> blocks;
     double confidence = -1.0;
     QString error;
-    if (!parseGeminiOcrText(result.body, text, confidence, error))
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0, error};
-    return OcrResult{OcrResult::Status::Ok, text, confidence, {}};
+    if (!parseGeminiOcrText(result.body, text, blocks, confidence, error))
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, error};
+    return OcrResult{OcrResult::Status::Ok, text, blocks, confidence, {}};
 }
 
 bool TesseractOcrEngine::available() const
@@ -132,10 +173,10 @@ bool TesseractOcrEngine::available() const
 OcrResult TesseractOcrEngine::recognize(const QImage &image)
 {
     if (!available())
-        return OcrResult{OcrResult::Status::NotAvailable, {}, -1.0,
+        return OcrResult{OcrResult::Status::NotAvailable, {}, {}, -1.0,
                          QStringLiteral("tesseract binary not found")};
     if (image.isNull() || image.width() <= 0 || image.height() <= 0)
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0,
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
                          QStringLiteral("Empty image passed to OCR")};
 
     QByteArray png;
@@ -143,41 +184,114 @@ OcrResult TesseractOcrEngine::recognize(const QImage &image)
         QBuffer buffer(&png);
         buffer.open(QIODevice::WriteOnly);
         if (!image.save(&buffer, "PNG"))
-            return OcrResult{OcrResult::Status::Failed, {}, -1.0,
+            return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
                              QStringLiteral("Could not encode image for OCR")};
     }
-    QProcess process;
-    process.start(QStringLiteral("tesseract"), {QStringLiteral("stdin"), QStringLiteral("stdout"),
-                                                QStringLiteral("--psm"), QStringLiteral("6"),
-                                                QStringLiteral("-l"), QStringLiteral("eng")});
-    if (!process.waitForStarted(3000))
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0,
-                         QStringLiteral("Could not start tesseract")};
-    process.write(png);
-    process.closeWriteChannel();
-    if (!process.waitForFinished(8000)) {
-        process.kill();
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0,
-                         QStringLiteral("tesseract timed out")};
+    // TSV first: one block per text line, with real coordinates — the
+    // overlay needs positions, not just flat text. If TSV yields nothing
+    // (empty image, parse failure), fall back to plain text as one
+    // whole-image block so the result is still usable.
+    auto runTesseract = [&png](const QString &mode, QByteArray *out, QString *err) {
+        QProcess process;
+        process.start(QStringLiteral("tesseract"),
+                      {QStringLiteral("stdin"), QStringLiteral("stdout"), mode,
+                       QStringLiteral("--psm"), QStringLiteral("6"),
+                       QStringLiteral("-l"), QStringLiteral("eng")});
+        if (!process.waitForStarted(3000)) {
+            *err = QStringLiteral("Could not start tesseract");
+            return false;
+        }
+        process.write(png);
+        process.closeWriteChannel();
+        if (!process.waitForFinished(8000)) {
+            process.kill();
+            *err = QStringLiteral("tesseract timed out");
+            return false;
+        }
+        if (process.exitCode() != 0) {
+            *err = QString::fromUtf8(process.readAllStandardError()).trimmed();
+            return false;
+        }
+        *out = process.readAllStandardOutput();
+        return true;
+    };
+    QByteArray tsv;
+    QString tsvError;
+    if (runTesseract(QStringLiteral("tsv"), &tsv, &tsvError)) {
+        QList<OcrBlock> blocks;
+        // TSV columns: level page block par line word left top width height
+        // conf text. Level 5 rows are words; group by (block, par, line).
+        QMap<QPair<int, QPair<int, int>>, QList<QPair<QString, QRectF>>> lines;
+        const QList<QByteArray> rows = tsv.split('\n');
+        for (qsizetype i = 1; i < rows.size(); ++i) { // row 0 is the header
+            const QList<QByteArray> cols = rows.at(i).split('\t');
+            if (cols.size() < 12)
+                continue;
+            bool ok = false;
+            const int level = cols.at(0).toInt(&ok);
+            if (!ok || level != 5)
+                continue;
+            const QString word = QString::fromUtf8(cols.at(11)).trimmed();
+            if (word.isEmpty())
+                continue;
+            const int blockNum = cols.at(2).toInt();
+            const int parNum = cols.at(3).toInt();
+            const int lineNum = cols.at(4).toInt();
+            const int left = cols.at(6).toInt();
+            const int top = cols.at(7).toInt();
+            const int width = cols.at(8).toInt();
+            const int height = cols.at(9).toInt();
+            if (width <= 0 || height <= 0)
+                continue;
+            const QRectF rect(qBound(0.0, double(left) / image.width(), 1.0),
+                              qBound(0.0, double(top) / image.height(), 1.0),
+                              qBound(0.0, double(width) / image.width(), 1.0),
+                              qBound(0.0, double(height) / image.height(), 1.0));
+            lines[qMakePair(blockNum, qMakePair(parNum, lineNum))]
+                .append(qMakePair(word, rect));
+        }
+        // QMap iterates keys in order: block, then paragraph, then line —
+        // the reading order for a single-column game UI.
+        for (auto it = lines.constBegin(); it != lines.constEnd(); ++it) {
+            QStringList words;
+            QRectF united;
+            for (const auto &wordRect : it.value()) {
+                words.append(wordRect.first);
+                united = united.united(wordRect.second);
+            }
+            if (!words.isEmpty() && united.isValid())
+                blocks.append(OcrBlock{words.join(QChar(u' ')), united});
+        }
+        if (!blocks.isEmpty()) {
+            QStringList texts;
+            texts.reserve(blocks.size());
+            for (const OcrBlock &block : blocks)
+                texts.append(block.text);
+            // Tesseract reports no per-call confidence on stdout; -1 = unknown.
+            return OcrResult{OcrResult::Status::Ok, texts.join(QChar(u'\n')), blocks, -1.0, {}};
+        }
     }
-    if (process.exitCode() != 0)
-        return OcrResult{OcrResult::Status::Failed, {}, -1.0,
-                         QString::fromUtf8(process.readAllStandardError()).trimmed()};
-    // Tesseract reports no per-call confidence on stdout; -1 = unknown.
-    return OcrResult{OcrResult::Status::Ok,
-                     QString::fromUtf8(process.readAllStandardOutput()).trimmed(), -1.0, {}};
+    QByteArray plain;
+    QString plainError;
+    if (!runTesseract(QStringLiteral("txt"), &plain, &plainError))
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, plainError};
+    const QString text = QString::fromUtf8(plain).trimmed();
+    QList<OcrBlock> blocks;
+    if (!text.isEmpty())
+        blocks.append(OcrBlock{text, QRectF(0, 0, 1, 1)});
+    return OcrResult{OcrResult::Status::Ok, text, blocks, -1.0, {}};
 }
 
 OcrResult RapidOcrEngine::recognize(const QImage &)
 {
-    return OcrResult{OcrResult::Status::NotAvailable, {}, -1.0,
+    return OcrResult{OcrResult::Status::NotAvailable, {}, {}, -1.0,
                      QStringLiteral("RapidOCR is not available in this build: "
                                     "ONNX Runtime is not vendored in v1")};
 }
 
 OcrResult WindowsOcrEngine::recognize(const QImage &)
 {
-    return OcrResult{OcrResult::Status::NotAvailable, {}, -1.0,
+    return OcrResult{OcrResult::Status::NotAvailable, {}, {}, -1.0,
                      QStringLiteral("Windows OCR is not available: WinRT OCR requires "
                                     "package identity, which this Win32 build does not have")};
 }

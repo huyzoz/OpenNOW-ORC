@@ -62,6 +62,10 @@ class TranslationEngine : public QObject
     Q_PROPERTY(bool lastCacheHit READ lastCacheHit NOTIFY translationTextChanged)
     Q_PROPERTY(QString lastError READ lastError NOTIFY statusChanged)
     Q_PROPERTY(bool hasTranslation READ hasTranslation NOTIFY hasTranslationChanged)
+    // One entry per translated line: {original, translated, x, y, w, h}
+    // with x/y/w/h normalized 0..1 in full-frame coordinates. The overlay
+    // draws one box per entry, over the English line it replaces.
+    Q_PROPERTY(QVariantList translationBlocks READ translationBlocks NOTIFY translationBlocksChanged)
 
 public:
     explicit TranslationEngine(QObject *parent = nullptr);
@@ -102,11 +106,19 @@ public:
     QString dialoguePreset() const { return m_dialoguePreset; }
     // Normalized rect for a preset, or a null rect for an unknown preset.
     static QRectF dialogueRectForPreset(const QString &preset);
+    // Converts worker blocks to the QML-facing QVariantList of maps
+    // {original, translated, x, y, w, h}. Pure, unit-testable.
+    static QVariantList blocksToVariantList(const QList<TranslatedBlock> &blocks);
+    // One block covering the whole rect (used when only flat text exists,
+    // e.g. a cache hit with no stored blocks). Pure, unit-testable.
+    static QVariantList singleBlockVariantList(const QString &original, const QString &translated,
+                                               const QRectF &rect);
     qint64 lastOcrMs() const { return m_lastOcrMs; }
     qint64 lastTranslateMs() const { return m_lastTranslateMs; }
     bool lastCacheHit() const { return m_lastCacheHit; }
     QString lastError() const { return m_lastError; }
     bool hasTranslation() const { return m_hasTranslation; }
+    QVariantList translationBlocks() const { return m_translationBlocks; }
 
     Q_INVOKABLE void onStreamFrame(const QImage &image);
     Q_INVOKABLE void requestTestTranslation(const QString &englishText);
@@ -134,11 +146,19 @@ signals:
     void dialogueRectChanged();
     void dialoguePresetChanged();
     void hasTranslationChanged();
+    void translationBlocksChanged();
+    // Emitted by the frame pump while translation is enabled. Application
+    // Startup connects it to NativeStreamRuntime::requestScreenshot(): the
+    // screenshotReady signal only fires for an explicit screenshot request,
+    // so without this pump the engine receives NO frames during gameplay
+    // and live OCR never runs (the v1 bug).
+    void frameRequested();
 
 private slots:
     void onStabilityTimeout();
     void onWorkerJobCompleted(const TranslationJobResult &result);
     void onKeepPreviousExpired();
+    void onFrameTimerTimeout();
 
 private:
     void setStatus(const QString &status);
@@ -148,7 +168,13 @@ private:
     void submitCrop(const QImage &crop, const QString &hash, const QRectF &rect);
     void emitTranslation(const QString &original, const QString &translated,
                          const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
-                         bool cacheHit);
+                         bool cacheHit, const QVariantList &blocks = {});
+    // TEST-section only: updates last* fields + status, but never touches
+    // the live overlay (hasTranslation / translationBlocks /
+    // translationReady). A "Dịch thử" result must never stick on the
+    // stream as a permanent subtitle (the v1 bug).
+    void setTestResult(const QString &original, const QString &translated,
+                       qint64 ocrMs, qint64 translateMs, bool cacheHit);
     void clearTranslation();
 
     bool m_enabled = false; // OFF by default: translation is opt-in
@@ -179,6 +205,14 @@ private:
 
     QTimer m_stabilityTimer;
     QTimer m_keepPreviousTimer;
+    // Frame pump: while translation is enabled, request one screenshot
+    // per interval so onStreamFrame actually receives frames during
+    // gameplay. requestScreenshot() is a no-op when the stream is not
+    // presenting, and returns false while one is already pending, so the
+    // pump can never pile up requests or save files (saving is gated on
+    // the user's own screenshot action in AppController).
+    QTimer m_frameTimer;
+    QVariantList m_translationBlocks;
     // Full-screen throttle: a full frame never sits still long enough for
     // the stability timer, so full-screen frames submit at most once per
     // FullScreenIntervalMs instead. Invalid until the first full-screen
@@ -188,11 +222,17 @@ private:
     QImage m_pendingCrop; // detached copy of the stable crop
     QRectF m_pendingRect;
     QString m_lastProcessedHash; // hash of the crop last sent to cache/worker
-    // Crop-hash -> (original, translated). Lets a repeated identical
-    // dialogue line hit the cache BEFORE any OCR/network, which the
-    // text-keyed cache cannot do (it needs the English text first).
+    // Crop-hash -> (original, translated, blocks). Lets a repeated
+    // identical dialogue line hit the cache BEFORE any OCR/network, which
+    // the text-keyed cache cannot do (it needs the English text first).
     // In-memory only; the text-keyed TranslationCache is the persisted one.
+    struct HashCacheEntry
+    {
+        QString original;
+        QString translated;
+        QVariantList blocks;
+    };
     static constexpr int MaxHashCacheEntries = 500;
-    QHash<QString, QPair<QString, QString>> m_hashCache;
+    QHash<QString, HashCacheEntry> m_hashCache;
     QList<QString> m_hashOrder; // oldest first; drives hash-cache eviction
 };
