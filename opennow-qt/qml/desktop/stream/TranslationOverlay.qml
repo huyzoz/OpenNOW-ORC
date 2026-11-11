@@ -22,7 +22,14 @@ Item {
     readonly property bool hasEngine: typeof translationEngine !== "undefined" && translationEngine !== null
     readonly property bool engineOn: root.hasEngine && translationEngine.enabled
     readonly property bool hasText: root.hasEngine && translationEngine.hasTranslation
-    readonly property string mode: root.hasEngine ? String(translationEngine.overlayMode || "inplace") : "off"
+    // A full-screen region can never render in-place (the box would hide
+    // the whole game), so it always renders as a subtitle bar. The engine
+    // also switches overlayMode to subtitle when the preset is chosen; this
+    // is the defense in depth for a rect set any other way.
+    readonly property bool fullScreenRegion: root.hasEngine
+        && translationEngine.dialogueRect.width >= 0.99 && translationEngine.dialogueRect.height >= 0.99
+    readonly property string mode: !root.hasEngine ? "off"
+        : root.fullScreenRegion ? "subtitle" : String(translationEngine.overlayMode || "inplace")
     // The parent screen (DesktopStreamScreen) exposes `streaming`; fall back
     // to showing on engine state alone when hosted anywhere else.
     readonly property bool parentStreaming: parent && parent.streaming !== undefined
@@ -30,41 +37,6 @@ Item {
     readonly property bool showing: root.engineOn && root.hasText && root.mode !== "off" && root.parentStreaming
 
     visible: root.showing
-
-    // Settings -> engine sync (integration fix): QML is the only side that
-    // can read ShellStore.settings, so this overlay — instantiated on the
-    // stream screen — mirrors "translation.*" into the C++ engine on load
-    // and whenever the settings map changes. Without this, the engine
-    // would keep its defaults (enabled=false) forever no matter what the
-    // Settings page saved. applySetting() replaces the whole settings
-    // object (SettingsState.qml), so settingsChanged fires on every save.
-    function syncEngineFromSettings() {
-        if (!root.hasEngine)
-            return
-        const s = ShellStore.settings || ({})
-        const get = (key, fallback) => {
-            const v = s["translation." + key]
-            return v === undefined || v === null ? fallback : v
-        }
-        translationEngine.enabled = get("enabled", false) === true
-        translationEngine.sourceLanguage = String(get("sourceLanguage", "en"))
-        translationEngine.targetLanguage = String(get("targetLanguage", "vi"))
-        translationEngine.ocrEngine = String(get("ocrEngine", "gemini-vision"))
-        translationEngine.translationProvider = String(get("translationProvider", "google"))
-        translationEngine.overlayMode = String(get("overlayMode", "inplace"))
-        translationEngine.stabilityDelayMs = Number(get("stabilityDelayMs", 400))
-        translationEngine.fontSizePx = Number(get("fontSizePx", 22))
-        translationEngine.showOriginal = get("showOriginal", false) === true
-        translationEngine.cacheEnabled = get("cacheEnabled", true) !== false
-        translationEngine.setDialoguePreset(String(get("dialoguePreset", "wuthering-waves")))
-    }
-
-    Component.onCompleted: root.syncEngineFromSettings()
-
-    Connections {
-        target: ShellStore
-        function onSettingsChanged() { root.syncEngineFromSettings() }
-    }
 
     // Dialogue area, normalized 0..1, from the engine (default
     // 0.05, 0.72, 0.90, 0.24). Converted to pixels against this item.
