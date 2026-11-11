@@ -389,3 +389,71 @@ Gemini API key field, or install Tesseract. Gemini Vision needs a key;
 RapidOCR and Windows OCR are still stubs. The "Dịch thử" TEST button
 works without a key (Google Translate, free). Live verification of the
 toggle + full-screen translation is still Ethan's eyes.
+
+## v2 — per-line in-place overlay + frame pump (2026-11-11 evening, local commit TBD)
+
+Ethan's live test of run #20 (video, 61s of WuWa gameplay): the translation
+never overwrote any English text. The ONLY thing on screen the whole video
+was one black subtitle bar at the bottom showing the same sentence —
+"Rover đi vào thành phố, tìm kiếm câu trả lời." — the default "Dịch thử"
+test input. He is right: v1 did not do what he asked for.
+
+Root causes found by reading the code (not guessing):
+1. NO FRAMES: `screenshotReady` fires only for an explicit screenshot
+   request (`requestScreenshot()` → fulfilled on the next presented frame
+   by `NativeStreamRenderCallback::prepareFrame`). During normal gameplay
+   nothing ever requests one, so `TranslationEngine::onStreamFrame` is
+   never called and live OCR literally never runs.
+2. TEST LEAK: `requestTestTranslation` went through `emitTranslation`,
+   which sets `hasTranslation` + emits `translationReady` — so the TEST
+   result stuck on the live overlay as a permanent subtitle bar. With no
+   jobs ever running, no error ever cleared it after 2s, so it stayed for
+   the whole video.
+3. DESIGN GAP: even with frames, v1 drew ONE box over the dialogue area
+   (or a subtitle bar for full-screen) — never Vietnamese text positioned
+   over each English line. That is not "dịch đè lên chữ tiếng Anh cũ".
+
+Fix (this change):
+- Frame pump: `TranslationEngine` runs a 1s `QTimer` while enabled and
+  emits `frameRequested`; `ApplicationStartup` connects it to
+  `NativeStreamRuntime::requestScreenshot()`. Verified safe:
+  `requestScreenshot()` is a no-op while no stream is presenting and
+  while one is already pending, and `AppController::saveStreamScreenshot`
+  only saves when the user took a screenshot (`m_screenshotPending`) —
+  the pump can neither pile up nor write files.
+- Per-line blocks: OCR now returns `OcrBlock{text, rect}` per line
+  (rect normalized 0..1 within the crop). Gemini prompt asks for JSON
+  `{"blocks": [{text, x, y, w, h}], "confidence"}` (old `{"text"}` shape
+  still accepted as one whole-image block). Tesseract runs `tsv` first
+  and groups level-5 word rows into lines by (block, par, line), with a
+  plain-text fallback as one whole-image block.
+- Worker translates the blocks joined with "\n" in ONE call (Google free
+  endpoint preserves line breaks), splits the reply back onto the blocks
+  (count mismatch → per-block fallback, never a guessed mapping), maps
+  each block rect to full-frame coords via `mapBlockRectToFrame`, and
+  never emits an empty block (an empty translation leaves the English
+  line visible instead of covering it with an empty box).
+- Engine publishes `translationBlocks` (QVariantList of
+  `{original, translated, x, y, w, h}`); the overlay's in-place mode is
+  now a `Repeater` drawing one box per block, padded 8px, exactly over
+  its English line. Subtitle mode joins the live blocks (never
+  `lastTranslatedText`). Full-screen no longer forces subtitle anywhere
+  (engine `setDialoguePreset` + overlay): per-line boxes work for the
+  whole frame.
+- TEST separation: `TranslationJob.testJob` flows through the worker
+  result; `setTestResult` updates only the TEST section's `last*` fields
+  + status — never `hasTranslation`, `translationBlocks`, or
+  `translationReady`. A failed test job also leaves the live overlay
+  alone.
+- Hash cache now stores blocks too, so a repeated identical crop still
+  hits before any OCR/network.
+- New unit tests: `mapBlockRectToFrame`, `blocksToVariantListRoundTrip`,
+  `testJobDoesNotShowOnStream` (engine instance, no network), and
+  `framePumpFiresWhenEnabled` (QSignalSpy, 1s pump). Python mirror 25/25;
+  `npm run locales:check` exit 0 (2326 texts, no new strings).
+
+Still NOT proven live: per-line box positions from real Gemini JSON
+(coordinates are the model's guess), the 1s pump's cost on his HD 4400,
+and the full flow end-to-end. Only Ethan's EliteBook can prove it — the
+overlay lives inside the Windows app on his machine, so no browser
+session (and no login as him) could test it.
