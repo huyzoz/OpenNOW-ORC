@@ -32,6 +32,7 @@
 #include <QRectF>
 #include <QString>
 #include <QTimer>
+#include <QVariant>
 
 #include "translation/TranslationCache.h"
 #include "translation/TranslationWorker.h"
