@@ -56,6 +56,25 @@ def dialogue_rect_for_preset(preset):
     return None
 
 
+def map_block_rect_to_frame(block, source):
+    # Mirrors mapBlockRectToFrame: an OCR block's rect (0..1 within the
+    # crop) into full-frame coords through the crop's source rect, clamped.
+    def clamp(v, lo, hi):
+        return max(lo, min(v, hi))
+    x = clamp(source[0] + block[0] * source[2], 0.0, 1.0)
+    y = clamp(source[1] + block[1] * source[3], 0.0, 1.0)
+    w = clamp(block[2] * source[2], 0.0, 1.0 - x)
+    h = clamp(block[3] * source[3], 0.0, 1.0 - y)
+    return (x, y, w, h)
+
+
+def blocks_to_variant_list(blocks):
+    # Mirrors TranslationEngine::blocksToVariantList: one dict per block.
+    return [{"original": b[0], "translated": b[1],
+             "x": b[2][0], "y": b[2][1], "w": b[2][2], "h": b[2][3]}
+            for b in blocks]
+
+
 class TranslationJobQueue:
     """Mirrors TranslationJobQueue: 1 running + 1 waiting, newest wins."""
 
@@ -136,6 +155,25 @@ def main():
           dialogue_rect_for_preset("full-screen") == (0, 0, 1, 1))
     check("preset unknown -> None",
           dialogue_rect_for_preset("bogus") is None)
+
+    # 2b. Block rect mapping mirrors mapBlockRectToFrame (v2 per-line overlay).
+    def near(a, b):
+        return all(abs(x - y) < 1e-9 for x, y in zip(a, b))
+    check("block in dialogue crop maps into frame",
+          near(map_block_rect_to_frame((0.1, 0.2, 0.5, 0.3), (0.05, 0.72, 0.90, 0.24)),
+               (0.14, 0.768, 0.45, 0.072)))
+    check("block in full-screen crop is already frame coords",
+          near(map_block_rect_to_frame((0.2, 0.1, 0.4, 0.05), (0, 0, 1, 1)),
+               (0.2, 0.1, 0.4, 0.05)))
+    check("block past the frame edge is clamped",
+          near(map_block_rect_to_frame((0.9, 0.9, 0.5, 0.5), (0, 0, 1, 1)),
+               (0.9, 0.9, 0.1, 0.1)))
+    variant = blocks_to_variant_list(
+        [("Hello", "Xin chào", (0.1, 0.2, 0.5, 0.1)),
+         ("World", "Thế giới", (0.1, 0.35, 0.4, 0.1))])
+    check("variant list keeps both blocks in order",
+          len(variant) == 2 and variant[0]["translated"] == "Xin chào"
+          and variant[1]["x"] == 0.1 and variant[1]["h"] == 0.1)
 
     # 3. Bounded queue drops the stale waiting job.
     q = TranslationJobQueue()

@@ -13,8 +13,11 @@
 #include <QImage>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMetaObject>
+#include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QVariant>
 
 class TranslationTest : public QObject
 {
@@ -212,6 +215,99 @@ private slots:
         QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("full-screen")),
                  QRectF(0, 0, 1, 1));
         QVERIFY(TranslationEngine::dialogueRectForPreset(QStringLiteral("bogus")).isNull());
+    }
+
+    void mapBlockRectToFrame()
+    {
+        // QRectF == is exact double equality, but the mapping does
+        // floating-point math: compare with a small tolerance.
+        auto nearRect = [](const QRectF &a, const QRectF &b) {
+            return qAbs(a.x() - b.x()) < 1e-9 && qAbs(a.y() - b.y()) < 1e-9
+                && qAbs(a.width() - b.width()) < 1e-9 && qAbs(a.height() - b.height()) < 1e-9;
+        };
+        // A block in the middle of the dialogue crop maps into the
+        // dialogue area of the frame.
+        QVERIFY(nearRect(
+            mapBlockRectToFrame(QRectF(0.1, 0.2, 0.5, 0.3), QRectF(0.05, 0.72, 0.90, 0.24)),
+            QRectF(0.14, 0.768, 0.45, 0.072)));
+        // Full-screen crop: block coords are already frame coords.
+        QVERIFY(nearRect(
+            mapBlockRectToFrame(QRectF(0.2, 0.1, 0.4, 0.05), QRectF(0, 0, 1, 1)),
+            QRectF(0.2, 0.1, 0.4, 0.05)));
+        // A block that would run past the frame edge is clamped.
+        QVERIFY(nearRect(
+            mapBlockRectToFrame(QRectF(0.9, 0.9, 0.5, 0.5), QRectF(0, 0, 1, 1)),
+            QRectF(0.9, 0.9, 0.1, 0.1)));
+    }
+
+    void blocksToVariantListRoundTrip()
+    {
+        const QList<TranslatedBlock> blocks = {
+            TranslatedBlock{QStringLiteral("Hello"), QStringLiteral("Xin chào"),
+                            QRectF(0.1, 0.2, 0.5, 0.1)},
+            TranslatedBlock{QStringLiteral("World"), QStringLiteral("Thế giới"),
+                            QRectF(0.1, 0.35, 0.4, 0.1)},
+        };
+        const QVariantList list = TranslationEngine::blocksToVariantList(blocks);
+        QCOMPARE(list.size(), 2);
+        QCOMPARE(list.at(0).toMap().value(QStringLiteral("translated")).toString(),
+                 QStringLiteral("Xin chào"));
+        QCOMPARE(list.at(1).toMap().value(QStringLiteral("x")).toDouble(), 0.1);
+        QCOMPARE(list.at(1).toMap().value(QStringLiteral("h")).toDouble(), 0.1);
+        // A flat text with no blocks becomes one block over the whole rect.
+        const QVariantList single = TranslationEngine::singleBlockVariantList(
+            QStringLiteral("Hi"), QStringLiteral("Chào"), QRectF(0.05, 0.72, 0.90, 0.24));
+        QCOMPARE(single.size(), 1);
+        QCOMPARE(single.at(0).toMap().value(QStringLiteral("y")).toDouble(), 0.72);
+    }
+
+    void testJobDoesNotShowOnStream()
+    {
+        TranslationEngine engine;
+        // A "Dịch thử" result updates the TEST section (last* fields) but
+        // must never appear on the live overlay: hasTranslation stays
+        // false and no blocks are published.
+        TranslationJobResult testResult;
+        testResult.ok = true;
+        testResult.testJob = true;
+        testResult.original = QStringLiteral("Hello world");
+        testResult.translated = QStringLiteral("Xin chào thế giới");
+        testResult.ocrMs = 10;
+        testResult.translateMs = 20;
+        QVERIFY(QMetaObject::invokeMethod(&engine, "onWorkerJobCompleted",
+                                          Q_ARG(TranslationJobResult, testResult)));
+        QCOMPARE(engine.lastTranslatedText(), QStringLiteral("Xin chào thế giới"));
+        QVERIFY(!engine.hasTranslation());
+        QVERIFY(engine.translationBlocks().isEmpty());
+
+        // A stream result DOES show: hasTranslation true, one block over
+        // the line it translates.
+        TranslationJobResult streamResult;
+        streamResult.ok = true;
+        streamResult.testJob = false;
+        streamResult.original = QStringLiteral("Hello world");
+        streamResult.translated = QStringLiteral("Xin chào thế giới");
+        streamResult.blocks = {TranslatedBlock{QStringLiteral("Hello world"),
+                                               QStringLiteral("Xin chào thế giới"),
+                                               QRectF(0.1, 0.2, 0.5, 0.1)}};
+        QVERIFY(QMetaObject::invokeMethod(&engine, "onWorkerJobCompleted",
+                                          Q_ARG(TranslationJobResult, streamResult)));
+        QVERIFY(engine.hasTranslation());
+        QCOMPARE(engine.translationBlocks().size(), 1);
+        QCOMPARE(engine.translationBlocks().at(0).toMap()
+                     .value(QStringLiteral("translated")).toString(),
+                 QStringLiteral("Xin chào thế giới"));
+    }
+
+    void framePumpFiresWhenEnabled()
+    {
+        TranslationEngine engine;
+        engine.setEnabled(false); // deterministic start: pump stopped
+        QSignalSpy spy(&engine, &TranslationEngine::frameRequested);
+        engine.setEnabled(true);
+        QVERIFY(spy.wait(3000)); // pump interval is 1s
+        QVERIFY(spy.count() >= 1);
+        engine.setEnabled(false);
     }
 };
 
