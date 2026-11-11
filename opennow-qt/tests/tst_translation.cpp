@@ -217,7 +217,7 @@ private slots:
         QVERIFY(TranslationEngine::dialogueRectForPreset(QStringLiteral("bogus")).isNull());
     }
 
-    void mapBlockRectToFrame()
+    void mapBlockRectToFrameCases()
     {
         // QRectF == is exact double equality, but the mapping does
         // floating-point math: compare with a small tolerance.
@@ -228,15 +228,15 @@ private slots:
         // A block in the middle of the dialogue crop maps into the
         // dialogue area of the frame.
         QVERIFY(nearRect(
-            mapBlockRectToFrame(QRectF(0.1, 0.2, 0.5, 0.3), QRectF(0.05, 0.72, 0.90, 0.24)),
+            ::mapBlockRectToFrame(QRectF(0.1, 0.2, 0.5, 0.3), QRectF(0.05, 0.72, 0.90, 0.24)),
             QRectF(0.14, 0.768, 0.45, 0.072)));
         // Full-screen crop: block coords are already frame coords.
         QVERIFY(nearRect(
-            mapBlockRectToFrame(QRectF(0.2, 0.1, 0.4, 0.05), QRectF(0, 0, 1, 1)),
+            ::mapBlockRectToFrame(QRectF(0.2, 0.1, 0.4, 0.05), QRectF(0, 0, 1, 1)),
             QRectF(0.2, 0.1, 0.4, 0.05)));
         // A block that would run past the frame edge is clamped.
         QVERIFY(nearRect(
-            mapBlockRectToFrame(QRectF(0.9, 0.9, 0.5, 0.5), QRectF(0, 0, 1, 1)),
+            ::mapBlockRectToFrame(QRectF(0.9, 0.9, 0.5, 0.5), QRectF(0, 0, 1, 1)),
             QRectF(0.9, 0.9, 0.1, 0.1)));
     }
 
