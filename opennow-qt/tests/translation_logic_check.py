@@ -44,6 +44,18 @@ def crop_image(pixels, width, height, rect):
     return out
 
 
+def dialogue_rect_for_preset(preset):
+    # Mirrors TranslationEngine::dialogueRectForPreset: normalized (x, y, w, h),
+    # or None for an unknown preset.
+    if preset == "wuthering-waves":
+        return (0.05, 0.72, 0.90, 0.24)
+    if preset == "generic":
+        return (0.05, 0.60, 0.90, 0.30)
+    if preset == "full-screen":
+        return (0, 0, 1, 1)
+    return None
+
+
 class TranslationJobQueue:
     """Mirrors TranslationJobQueue: 1 running + 1 waiting, newest wins."""
 
@@ -114,6 +126,16 @@ def main():
     frame = [0] * (200 * 100)
     crop = crop_image(frame, 200, 100, (0.05, 0.72, 0.90, 0.24))
     check("default dialogue crop is 180x24", len(crop) == 180 * 24)
+
+    # Dialogue presets mirror TranslationEngine::dialogueRectForPreset.
+    check("preset wuthering-waves rect",
+          dialogue_rect_for_preset("wuthering-waves") == (0.05, 0.72, 0.90, 0.24))
+    check("preset generic rect",
+          dialogue_rect_for_preset("generic") == (0.05, 0.60, 0.90, 0.30))
+    check("preset full-screen covers whole frame",
+          dialogue_rect_for_preset("full-screen") == (0, 0, 1, 1))
+    check("preset unknown -> None",
+          dialogue_rect_for_preset("bogus") is None)
 
     # 3. Bounded queue drops the stale waiting job.
     q = TranslationJobQueue()

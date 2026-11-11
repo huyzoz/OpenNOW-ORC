@@ -200,6 +200,19 @@ private slots:
         QCOMPARE(gemini.recognize(image).status, OcrResult::Status::NotAvailable);
         QVERIFY(createOcrEngine(QStringLiteral("bogus")) == nullptr);
     }
+
+    void dialoguePresetRects()
+    {
+        QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("wuthering-waves")),
+                 QRectF(0.05, 0.72, 0.90, 0.24));
+        QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("generic")),
+                 QRectF(0.05, 0.60, 0.90, 0.30));
+        // Full screen: the whole frame, so every line of text is OCR'd,
+        // not just the dialogue box.
+        QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("full-screen")),
+                 QRectF(0, 0, 1, 1));
+        QVERIFY(TranslationEngine::dialogueRectForPreset(QStringLiteral("bogus")).isNull());
+    }
 };
 
 QTEST_MAIN(TranslationTest)
