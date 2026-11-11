@@ -1738,8 +1738,6 @@ QtObject {
     }
 
     function runAutomaticUpdates() {
-        if (root.vnTranslationBuild)
-            return // VN fork: no automatic upstream update checks (see above).
         if (!ready || !updaterSessionSafe || updaterBusy)
             return
         if (settings.autoDownloadUpdates === true && updaterState.canDownload === true) {
