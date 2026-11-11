@@ -1565,6 +1565,7 @@ if(BUILD_TESTING)
         opennow-controllertuning-tests
         opennow-controllersources-tests
         opennow-controllermetadata-tests
+        opennow-translation-tests
     )
     if(TARGET opennow-nativeframegeneration-tests)
         list(APPEND OPENNOW_CI_UNIT_TEST_TARGETS opennow-nativeframegeneration-tests)
