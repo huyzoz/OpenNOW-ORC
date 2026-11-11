@@ -8,8 +8,10 @@
 // Pipeline (onStreamFrame, GUI thread only):
 //   1. Ignore when disabled or the image is null/empty.
 //   2. Crop dialogueRect (normalized 0..1) and SHA-256-hash the crop.
-//   3. Only proceed once the hash is unchanged for stabilityDelayMs
-//      (QTimer restarts on every hash change).
+//   3. Dialogue presets only proceed once the hash is unchanged for
+//      stabilityDelayMs (QTimer restarts on every hash change). The
+//      full-screen preset never stabilizes (HUD/animation pixels change
+//      every frame), so it submits at most once per 2s instead.
 //   4. Cache lookup first: WuWa dialogue DB, then the memory cache.
 //      A hit emits translationReady immediately (lastCacheHit=true) with
 //      no network at all.
@@ -21,6 +23,7 @@
 // for 2s, and no garbage text is ever emitted.
 #pragma once
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QImage>
 #include <QList>
@@ -51,6 +54,9 @@ class TranslationEngine : public QObject
     Q_PROPERTY(QString lastTranslatedText READ lastTranslatedText NOTIFY translationTextChanged)
     Q_PROPERTY(QString lastOriginalText READ lastOriginalText NOTIFY translationTextChanged)
     Q_PROPERTY(QRectF dialogueRect READ dialogueRect WRITE setDialogueRect NOTIFY dialogueRectChanged)
+    // "wuthering-waves" (dialogue bottom bar), "generic" (lower third),
+    // "full-screen" (whole frame — every line of text, not just dialogue).
+    Q_PROPERTY(QString dialoguePreset READ dialoguePreset WRITE setDialoguePreset NOTIFY dialoguePresetChanged)
     Q_PROPERTY(qint64 lastOcrMs READ lastOcrMs NOTIFY translationTextChanged)
     Q_PROPERTY(qint64 lastTranslateMs READ lastTranslateMs NOTIFY translationTextChanged)
     Q_PROPERTY(bool lastCacheHit READ lastCacheHit NOTIFY translationTextChanged)
@@ -93,6 +99,9 @@ public:
     QString lastOriginalText() const { return m_lastOriginalText; }
     QRectF dialogueRect() const { return m_dialogueRect; }
     void setDialogueRect(const QRectF &rect);
+    QString dialoguePreset() const { return m_dialoguePreset; }
+    // Normalized rect for a preset, or a null rect for an unknown preset.
+    static QRectF dialogueRectForPreset(const QString &preset);
     qint64 lastOcrMs() const { return m_lastOcrMs; }
     qint64 lastTranslateMs() const { return m_lastTranslateMs; }
     bool lastCacheHit() const { return m_lastCacheHit; }
@@ -123,6 +132,7 @@ signals:
     void showOriginalChanged();
     void cacheEnabledChanged();
     void dialogueRectChanged();
+    void dialoguePresetChanged();
     void hasTranslationChanged();
 
 private slots:
@@ -133,6 +143,9 @@ private slots:
 private:
     void setStatus(const QString &status);
     void setError(const QString &error);
+    // Cache-first submit of one stable crop to the worker (shared by the
+    // stability-timeout path and the full-screen throttle path).
+    void submitCrop(const QImage &crop, const QString &hash, const QRectF &rect);
     void emitTranslation(const QString &original, const QString &translated,
                          const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
                          bool cacheHit);
@@ -152,6 +165,7 @@ private:
     QString m_lastTranslatedText;
     QString m_lastOriginalText;
     QRectF m_dialogueRect = QRectF(0.05, 0.72, 0.90, 0.24);
+    QString m_dialoguePreset = QStringLiteral("wuthering-waves");
     qint64 m_lastOcrMs = 0;
     qint64 m_lastTranslateMs = 0;
     bool m_lastCacheHit = false;
@@ -165,6 +179,11 @@ private:
 
     QTimer m_stabilityTimer;
     QTimer m_keepPreviousTimer;
+    // Full-screen throttle: a full frame never sits still long enough for
+    // the stability timer, so full-screen frames submit at most once per
+    // FullScreenIntervalMs instead. Invalid until the first full-screen
+    // frame, so the first frame submits immediately.
+    QElapsedTimer m_fullScreenThrottle;
     QString m_pendingHash;
     QImage m_pendingCrop; // detached copy of the stable crop
     QRectF m_pendingRect;

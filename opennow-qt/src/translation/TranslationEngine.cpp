@@ -10,6 +10,16 @@
 
 namespace {
 constexpr int KeepPreviousMs = 2000;
+// Full-screen crops never stabilize: HUD pixels, animations and the game
+// clock change every frame, so the stability timer would restart forever
+// and OCR would never run. Full-screen mode throttles instead: at most
+// one OCR job per interval, newest frame wins.
+constexpr int FullScreenIntervalMs = 2000;
+
+bool isFullScreenRect(const QRectF &rect)
+{
+    return rect.width() >= 0.99 && rect.height() >= 0.99;
+}
 
 QRectF clampNormalized(const QRectF &rect)
 {
@@ -45,6 +55,14 @@ QString resolveDialogueDbPath()
         return QStringLiteral(":/translation/wuwa-dialogue-db.json");
     return appData; // default target: loadDialogueDb() tolerates a missing file
 }
+// Persist one translation setting under "translation/<key>" in QSettings.
+// The Rust core owns ShellStore.settings and rejects unknown keys, so
+// translation settings must never go through it (see constructor).
+void saveTranslationSetting(const QString &key, const QVariant &value)
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("translation/") + key, value);
+}
 } // namespace
 
 TranslationEngine::TranslationEngine(QObject *parent)
@@ -71,6 +89,54 @@ TranslationEngine::TranslationEngine(QObject *parent)
         if (!m_geminiApiKey.isEmpty())
             QMetaObject::invokeMethod(m_worker, "setGeminiApiKey", Qt::QueuedConnection,
                                       Q_ARG(QString, m_geminiApiKey));
+    }
+    // Translation settings are persisted by THIS engine in QSettings
+    // (translation/<key>), never through ShellStore.settings: the Rust
+    // core rejects unknown setting keys ("Unknown setting:
+    // translation.enabled"), so a write through the core is rolled back
+    // about a second later and the Settings toggle flips back off. The
+    // QML page binds straight to this engine's properties.
+    {
+        const QSettings settings;
+        m_enabled = settings.value(QStringLiteral("translation/enabled"), false).toBool();
+        m_sourceLanguage = settings.value(QStringLiteral("translation/sourceLanguage"),
+                                          QStringLiteral("en")).toString();
+        m_targetLanguage = settings.value(QStringLiteral("translation/targetLanguage"),
+                                          QStringLiteral("vi")).toString();
+        m_ocrEngine = settings.value(QStringLiteral("translation/ocrEngine"),
+                                     QStringLiteral("gemini-vision")).toString();
+        m_translationProvider = settings.value(QStringLiteral("translation/translationProvider"),
+                                               QStringLiteral("google")).toString();
+        m_overlayMode = settings.value(QStringLiteral("translation/overlayMode"),
+                                       QStringLiteral("inplace")).toString();
+        m_stabilityDelayMs = settings.value(QStringLiteral("translation/stabilityDelayMs"), 400).toInt();
+        m_fontSizePx = settings.value(QStringLiteral("translation/fontSizePx"), 22).toInt();
+        m_showOriginal = settings.value(QStringLiteral("translation/showOriginal"), false).toBool();
+        m_cacheEnabled = settings.value(QStringLiteral("translation/cacheEnabled"), true).toBool();
+        m_dialoguePreset = settings.value(QStringLiteral("translation/dialoguePreset"),
+                                          QStringLiteral("wuthering-waves")).toString();
+        const QRectF presetRect = dialogueRectForPreset(m_dialoguePreset);
+        if (!presetRect.isNull())
+            m_dialogueRect = presetRect;
+        else
+            m_dialoguePreset = QStringLiteral("wuthering-waves");
+        // Clamp anything a hand-edited config file may have corrupted.
+        if (m_sourceLanguage.isEmpty())
+            m_sourceLanguage = QStringLiteral("en");
+        if (m_targetLanguage.isEmpty())
+            m_targetLanguage = QStringLiteral("vi");
+        if (!QStringList{QStringLiteral("gemini-vision"), QStringLiteral("tesseract"),
+                         QStringLiteral("rapidocr"), QStringLiteral("windows-ocr")}
+                 .contains(m_ocrEngine))
+            m_ocrEngine = QStringLiteral("gemini-vision");
+        if (!QStringList{QStringLiteral("google"), QStringLiteral("gemini")}
+                 .contains(m_translationProvider))
+            m_translationProvider = QStringLiteral("google");
+        if (!QStringList{QStringLiteral("inplace"), QStringLiteral("subtitle"), QStringLiteral("off")}
+                 .contains(m_overlayMode))
+            m_overlayMode = QStringLiteral("inplace");
+        m_stabilityDelayMs = qBound(0, m_stabilityDelayMs, 5000);
+        m_fontSizePx = qBound(10, m_fontSizePx, 64);
     }
     setStatus(QStringLiteral("Translation ready"));
 }
@@ -115,6 +181,7 @@ void TranslationEngine::setEnabled(bool enabled)
     if (m_enabled == enabled)
         return;
     m_enabled = enabled;
+    saveTranslationSetting(QStringLiteral("enabled"), enabled);
     if (!m_enabled) {
         m_stabilityTimer.stop();
         m_pendingHash.clear();
@@ -131,6 +198,7 @@ void TranslationEngine::setSourceLanguage(const QString &language)
     if (language.isEmpty() || m_sourceLanguage == language)
         return;
     m_sourceLanguage = language;
+    saveTranslationSetting(QStringLiteral("sourceLanguage"), language);
     emit sourceLanguageChanged();
 }
 
@@ -139,6 +207,7 @@ void TranslationEngine::setTargetLanguage(const QString &language)
     if (language.isEmpty() || m_targetLanguage == language)
         return;
     m_targetLanguage = language;
+    saveTranslationSetting(QStringLiteral("targetLanguage"), language);
     emit targetLanguageChanged();
 }
 
@@ -149,6 +218,7 @@ void TranslationEngine::setOcrEngine(const QString &engine)
     if (!valid.contains(engine) || m_ocrEngine == engine)
         return;
     m_ocrEngine = engine;
+    saveTranslationSetting(QStringLiteral("ocrEngine"), engine);
     emit ocrEngineChanged();
 }
 
@@ -158,6 +228,7 @@ void TranslationEngine::setTranslationProvider(const QString &provider)
     if (!valid.contains(provider) || m_translationProvider == provider)
         return;
     m_translationProvider = provider;
+    saveTranslationSetting(QStringLiteral("translationProvider"), provider);
     emit translationProviderChanged();
 }
 
@@ -168,6 +239,7 @@ void TranslationEngine::setOverlayMode(const QString &mode)
     if (!valid.contains(mode) || m_overlayMode == mode)
         return;
     m_overlayMode = mode;
+    saveTranslationSetting(QStringLiteral("overlayMode"), mode);
     emit overlayModeChanged();
 }
 
@@ -177,6 +249,7 @@ void TranslationEngine::setStabilityDelayMs(int ms)
     if (m_stabilityDelayMs == ms)
         return;
     m_stabilityDelayMs = ms;
+    saveTranslationSetting(QStringLiteral("stabilityDelayMs"), ms);
     emit stabilityDelayMsChanged();
 }
 
@@ -186,6 +259,7 @@ void TranslationEngine::setFontSizePx(int px)
     if (m_fontSizePx == px)
         return;
     m_fontSizePx = px;
+    saveTranslationSetting(QStringLiteral("fontSizePx"), px);
     emit fontSizePxChanged();
 }
 
@@ -194,6 +268,7 @@ void TranslationEngine::setShowOriginal(bool show)
     if (m_showOriginal == show)
         return;
     m_showOriginal = show;
+    saveTranslationSetting(QStringLiteral("showOriginal"), show);
     emit showOriginalChanged();
 }
 
@@ -202,6 +277,7 @@ void TranslationEngine::setCacheEnabled(bool enabled)
     if (m_cacheEnabled == enabled)
         return;
     m_cacheEnabled = enabled;
+    saveTranslationSetting(QStringLiteral("cacheEnabled"), enabled);
     emit cacheEnabledChanged();
 }
 
@@ -214,15 +290,35 @@ void TranslationEngine::setDialogueRect(const QRectF &rect)
     emit dialogueRectChanged();
 }
 
+QRectF TranslationEngine::dialogueRectForPreset(const QString &preset)
+{
+    if (preset == QStringLiteral("wuthering-waves"))
+        return QRectF(0.05, 0.72, 0.90, 0.24);
+    if (preset == QStringLiteral("generic"))
+        return QRectF(0.05, 0.60, 0.90, 0.30);
+    if (preset == QStringLiteral("full-screen"))
+        return QRectF(0, 0, 1, 1);
+    return QRectF();
+}
+
 void TranslationEngine::setDialoguePreset(const QString &preset)
 {
-    if (preset == QStringLiteral("wuthering-waves")) {
-        setDialogueRect(QRectF(0.05, 0.72, 0.90, 0.24));
-    } else if (preset == QStringLiteral("generic")) {
-        setDialogueRect(QRectF(0.05, 0.60, 0.90, 0.30));
-    } else {
+    const QRectF rect = dialogueRectForPreset(preset);
+    if (rect.isNull()) {
         setError(QStringLiteral("Unknown dialogue preset"));
+        return;
     }
+    const bool changed = m_dialoguePreset != preset;
+    m_dialoguePreset = preset;
+    if (changed) {
+        saveTranslationSetting(QStringLiteral("dialoguePreset"), preset);
+        emit dialoguePresetChanged();
+    }
+    setDialogueRect(rect);
+    // An in-place box over the whole frame would hide the game: show the
+    // full-screen translation as a subtitle bar instead.
+    if (preset == QStringLiteral("full-screen") && m_overlayMode == QStringLiteral("inplace"))
+        setOverlayMode(QStringLiteral("subtitle"));
 }
 
 void TranslationEngine::setGeminiApiKey(const QString &key)
@@ -268,6 +364,15 @@ void TranslationEngine::onStreamFrame(const QImage &image)
         return;
     if (hash == m_lastProcessedHash)
         return; // already translated this exact crop
+    if (isFullScreenRect(m_dialogueRect)) {
+        // Full-screen crops never stabilize (see FullScreenIntervalMs):
+        // throttle instead of waiting for a still frame.
+        if (m_fullScreenThrottle.isValid() && m_fullScreenThrottle.elapsed() < FullScreenIntervalMs)
+            return;
+        m_fullScreenThrottle.restart();
+        submitCrop(crop, hash, m_dialogueRect);
+        return;
+    }
     if (hash != m_pendingHash) {
         // New content: (re)start the stability wait.
         m_pendingHash = hash;
@@ -279,18 +384,9 @@ void TranslationEngine::onStreamFrame(const QImage &image)
     // do not restart it.
 }
 
-void TranslationEngine::onStabilityTimeout()
+void TranslationEngine::submitCrop(const QImage &crop, const QString &hash, const QRectF &rect)
 {
-    if (!m_enabled || m_pendingHash.isEmpty() || m_pendingCrop.isNull())
-        return;
-    if (m_pendingHash == m_lastProcessedHash)
-        return;
-    m_lastProcessedHash = m_pendingHash;
-    const QImage crop = m_pendingCrop;
-    const QRectF rect = m_pendingRect;
-    m_pendingHash.clear();
-    m_pendingCrop = QImage();
-
+    m_lastProcessedHash = hash;
     if (m_overlayMode == QStringLiteral("off"))
         return;
 
@@ -300,7 +396,7 @@ void TranslationEngine::onStabilityTimeout()
     // requestTestTranslation, and every worker result is inserted into
     // both caches, so the two stay in sync.)
     if (m_cacheEnabled) {
-        const auto hit = m_hashCache.constFind(m_lastProcessedHash);
+        const auto hit = m_hashCache.constFind(hash);
         if (hit != m_hashCache.constEnd()) {
             emitTranslation(hit->first, hit->second, rect, 0, 0, true);
             return;
@@ -309,7 +405,7 @@ void TranslationEngine::onStabilityTimeout()
 
     TranslationJob job;
     job.crop = crop;
-    job.cropHash = m_lastProcessedHash;
+    job.cropHash = hash;
     job.sourceRect = rect;
     job.ocrEngineId = m_ocrEngine;
     job.providerId = m_translationProvider;
@@ -319,6 +415,20 @@ void TranslationEngine::onStabilityTimeout()
     setStatus(QStringLiteral("Reading dialogue…"));
     QMetaObject::invokeMethod(m_worker, "submitJob", Qt::QueuedConnection,
                               Q_ARG(TranslationJob, job));
+}
+
+void TranslationEngine::onStabilityTimeout()
+{
+    if (!m_enabled || m_pendingHash.isEmpty() || m_pendingCrop.isNull())
+        return;
+    if (m_pendingHash == m_lastProcessedHash)
+        return;
+    const QImage crop = m_pendingCrop;
+    const QString hash = m_pendingHash;
+    const QRectF rect = m_pendingRect;
+    m_pendingHash.clear();
+    m_pendingCrop = QImage();
+    submitCrop(crop, hash, rect);
 }
 
 void TranslationEngine::requestTestTranslation(const QString &englishText)

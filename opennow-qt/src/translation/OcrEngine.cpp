@@ -13,10 +13,11 @@
 namespace {
 constexpr auto GeminiModel = "gemini-2.5-flash-lite";
 constexpr auto GeminiOcrPrompt =
-    "Extract only the English dialogue or subtitle text visible in this image. "
+    "Extract all English text visible in this image (dialogue, subtitles, menus, labels), "
+    "line by line, in reading order. "
     "Reply with JSON only, no other text: {\"text\": \"...\", \"confidence\": 0.0}. "
     "confidence is 0.0-1.0 for how sure you are the text is correct. "
-    "If no English dialogue text is visible, reply {\"text\": \"\", \"confidence\": 0}.";
+    "If no English text is visible, reply {\"text\": \"\", \"confidence\": 0}.";
 
 QString geminiUrl()
 {
