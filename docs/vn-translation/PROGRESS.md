@@ -346,3 +346,46 @@ running; R4–R8 are follow-ups.**
   file touched outside the original 3 shims, and it is documented in
   `UPDATER.md` §4. Full repoint to `duyzoz/OpenNOW-ORC` + a VN keypair is
   still a separate approved step touching `native/`.
+
+## 2026-11-11 — Live-test fix: toggle won't stay on + full-screen region (run #14)
+
+Ethan live-tested the run #13 build (video 17:34): Settings > Translation
+renders correctly in Vietnamese, but the "Dịch màn hình" toggle flips ON
+then back OFF after ~1s, and the TEST section says "Translation engine
+chưa sẵn sàng". Root causes, both from the overnight build:
+
+1. `DesktopSettingsTranslationPage.qml` used `page.hasEngine` /
+   `page.keySaved` but never declared them (undefined = falsy), so
+   `pushToEngine()` always returned early — no setting ever reached the
+   engine, and Test / Save-key / Clear-cache stayed disabled.
+2. Translation settings were written through `ShellStore.setSetting` to
+   the Rust core, whose `SettingsStore::set` rejects unknown keys
+   (`settings.rs:206` — "Unknown setting: translation.enabled" ->
+   `invalid_setting`). The optimistic apply showed the toggle ON for ~1s,
+   then `finishSettingWrite` -> `reconcileSetting` restored the old value.
+
+Fix (no `native/` changes — that area stays untouched per Ethan's order):
+- The C++ engine is now the store of record: every setting is loaded
+  from / saved to QSettings under `translation/<key>` (same store the
+  Gemini key already used). The QML page binds straight to the engine's
+  properties; the overlay's `syncEngineFromSettings()` (which would have
+  overwritten engine values with ShellStore fallbacks) is deleted.
+- New preset "Toàn màn hình" (`full-screen`, rect 0,0,1,1): OCR reads the
+  whole frame — dialogue, menus, labels — not just the dialogue box.
+  Gemini OCR prompt widened from dialogue-only to all English text.
+  Full-screen frames never stabilize (HUD/animation pixels change every
+  frame), so the stability-hash gate is replaced by a 2s throttle
+  (`FullScreenIntervalMs`) in that mode. An in-place box over the whole
+  frame would hide the game, so selecting full-screen auto-switches the
+  display mode to subtitle (engine-side) and the overlay forces subtitle
+  for full-screen rects (defense in depth).
+- Unit test `dialoguePresetRects` (static `dialogueRectForPreset` helper)
+  + Python mirror checks; `npm run locales:check` exit 0 (2326 texts,
+  2 new qmlSource entries: `toan_man_hinh`, `toan_bo_man_hinh`).
+
+Still NOT fixed by this change — Ethan must do one of these for OCR to
+run at all: paste a free Gemini API key (Google AI Studio) into the
+Gemini API key field, or install Tesseract. Gemini Vision needs a key;
+RapidOCR and Windows OCR are still stubs. The "Dịch thử" TEST button
+works without a key (Google Translate, free). Live verification of the
+toggle + full-screen translation is still Ethan's eyes.
