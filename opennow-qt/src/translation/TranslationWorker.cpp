@@ -207,8 +207,8 @@ void TranslationWorker::processNext()
             // translate. Report success with empty text so the engine can
             // keep the previous translation instead of showing an error.
             result.ok = true;
-            result.original = {};
-            result.translated = {};
+            result.original.clear();
+            result.translated.clear();
             result.ocrMs = ocrMs;
             m_queue.finishRunning();
             m_processing = false;
