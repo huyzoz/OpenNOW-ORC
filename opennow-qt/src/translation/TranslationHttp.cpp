@@ -49,7 +49,7 @@ TranslationHttpResult TranslationHttp::request(
     // or use it on the GUI thread from the worker.
     for (int attempt = 0; attempt < 2; ++attempt) {
         QNetworkAccessManager manager;
-        QNetworkRequest request(QUrl(url));
+        QNetworkRequest request(QUrl{url});
         for (const auto &header : headers)
             request.setRawHeader(header.first, header.second);
         QNetworkReply *reply = nullptr;
