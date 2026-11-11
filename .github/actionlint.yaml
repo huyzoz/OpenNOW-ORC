@@ -1,1 +1,17 @@
-c2VsZi1ob3N0ZWQtcnVubmVyOgogIGxhYmVsczoKICAgIC0gdWJ1bnR1LTI0LjA0CiAgICAtIHVidW50dS0yNC4wNC1hcm0KICAgIC0gd2luZG93cy0yMDI1CiAgICAtIHVidW50dS0yNC4wNAogICAgLSB1YnVudHUtMjQuMDQtYXJtCiAgICAtIHdpbmRvd3MtMjAyNQogICAgLSBtYWNvcy0xNQogICAgLSBtYWNvcy1sYXRlc3QKICAgIC0gdWJ1bnR1LTI0LjA0CiAgICAtIHVidW50dS0yNC4wNC1hcm0KICAgIC0gd2luZG93cy0yMDI1CiAgICAtIHVidW50dS0yNC4wNAogICAgLSB3aW5kb3dzLTIwMjUKCmNvbmZpZy12YXJpYWJsZXM6IG51bGwK
+self-hosted-runner:
+  labels:
+    - ubuntu-24.04
+    - ubuntu-24.04-arm
+    - windows-2025
+    - ubuntu-24.04
+    - ubuntu-24.04-arm
+    - windows-2025
+    - macos-15
+    - macos-latest
+    - ubuntu-24.04
+    - ubuntu-24.04-arm
+    - windows-2025
+    - ubuntu-24.04
+    - windows-2025
+
+config-variables: null
