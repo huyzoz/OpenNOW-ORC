@@ -4573,6 +4573,8 @@
       "tesseract": "Tesseract",
       "thanh_cuoi_man_hinh": "Thanh cuối màn hình",
       "tieng_viet": "Tiếng Việt",
+      "toan_bo_man_hinh": "Toàn bộ màn hình",
+      "toan_man_hinh": "Toàn màn hình",
       "translation_engine_chua_san_sang_ang_cho_phan_c_cai_at_ben_duoi_van_luu_binh_thuong": "Translation engine chưa sẵn sàng (đang chờ phần C++). Cài đặt bên dưới vẫn lưu bình thường.",
       "translation_engine_chua_san_sang": "Translation engine chưa sẵn sàng.",
       "trang_thai": "Trạng thái",
