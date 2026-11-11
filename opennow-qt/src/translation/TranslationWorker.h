@@ -13,6 +13,7 @@
 #pragma once
 
 #include <QImage>
+#include <QMetaType>
 #include <QMutex>
 #include <QObject>
 #include <QRectF>

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <QList>
+#include <QMetaType>
 #include <QRectF>
 #include <QString>
 #include <memory>
