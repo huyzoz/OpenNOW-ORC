@@ -161,6 +161,124 @@ private slots:
         QCOMPARE(missing.size(), 0);
     }
 
+    void dialogueDbChunkFileMergesWithoutClearing()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString seedPath = dir.filePath(QStringLiteral("seed.json"));
+        const QString chunkPath = dir.filePath(QStringLiteral("chunk.json"));
+        const QString badPath = dir.filePath(QStringLiteral("bad.json"));
+        QJsonObject seedEntries;
+        seedEntries.insert(QStringLiteral("Hello, Rover"), QStringLiteral("Chào, Rover"));
+        QJsonObject seedRoot;
+        seedRoot.insert(QStringLiteral("version"), 1);
+        seedRoot.insert(QStringLiteral("entries"), seedEntries);
+        QFile seedFile(seedPath);
+        QVERIFY(seedFile.open(QIODevice::WriteOnly));
+        seedFile.write(QJsonDocument(seedRoot).toJson(QJsonDocument::Compact));
+        seedFile.close();
+        QJsonObject chunkEntries;
+        chunkEntries.insert(QStringLiteral("Hello, Rover"), QStringLiteral("Chào Rover 2"));
+        chunkEntries.insert(QStringLiteral("Talk to Shilang"), QStringLiteral("Nói chuyện với Shilang"));
+        chunkEntries.insert(QStringLiteral("Good morning"), QStringLiteral("Chào buổi sáng"));
+        QJsonObject chunkRoot;
+        chunkRoot.insert(QStringLiteral("version"), 1);
+        chunkRoot.insert(QStringLiteral("entries"), chunkEntries);
+        QFile chunkFile(chunkPath);
+        QVERIFY(chunkFile.open(QIODevice::WriteOnly));
+        chunkFile.write(QJsonDocument(chunkRoot).toJson(QJsonDocument::Compact));
+        chunkFile.close();
+        QFile badFile(badPath);
+        QVERIFY(badFile.open(QIODevice::WriteOnly));
+        badFile.write(QByteArrayLiteral("{not json"));
+        badFile.close();
+
+        WuWaDialogueDb db;
+        QVERIFY(db.loadDialogueDb(seedPath));
+        QCOMPARE(db.size(), 1);
+        // Merge: seed entry stays unless the chunk overrides it.
+        QVERIFY(db.loadChunkFile(chunkPath));
+        QCOMPARE(db.size(), 3);
+        QString out;
+        QVERIFY(db.lookup(QStringLiteral("hello, rover"), out));
+        QCOMPARE(out, QStringLiteral("Chào Rover 2"));
+        QVERIFY(db.lookup(QStringLiteral("talk to shilang"), out));
+        QCOMPARE(out, QStringLiteral("Nói chuyện với Shilang"));
+        // Missing chunk file: skipped, not an error. Invalid JSON: error.
+        QVERIFY(db.loadChunkFile(dir.filePath(QStringLiteral("nope.json"))));
+        QCOMPARE(db.size(), 3);
+        QVERIFY(!db.loadChunkFile(badPath));
+        QCOMPARE(db.size(), 3);
+    }
+
+    void dialogueDbClearEmptiesIt()
+    {
+        WuWaDialogueDb db;
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("wuwa.json"));
+        QJsonObject entries;
+        entries.insert(QStringLiteral("Hello, Rover"), QStringLiteral("Chào, Rover"));
+        QJsonObject root;
+        root.insert(QStringLiteral("version"), 1);
+        root.insert(QStringLiteral("entries"), entries);
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        file.close();
+        QVERIFY(db.loadDialogueDb(path));
+        QCOMPARE(db.size(), 1);
+        db.clear();
+        QCOMPARE(db.size(), 0);
+        QString out;
+        QVERIFY(!db.lookup(QStringLiteral("hello, rover"), out));
+        QVERIFY(!db.lookupFuzzy(QStringLiteral("hello, rover"), out));
+    }
+
+    void dialogueDbFuzzyLookupToleratesOcrNoise()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(QStringLiteral("wuwa.json"));
+        QJsonObject entries;
+        entries.insert(QStringLiteral("Talk to Shilang"), QStringLiteral("Nói chuyện với Shilang"));
+        entries.insert(QStringLiteral("The Rover walks into the city"),
+                       QStringLiteral("Rover bước vào thành phố"));
+        entries.insert(QStringLiteral("Leave the room and take a look outside"),
+                       QStringLiteral("Rời khỏi phòng và nhìn ra ngoài"));
+        QJsonObject root;
+        root.insert(QStringLiteral("version"), 1);
+        root.insert(QStringLiteral("entries"), entries);
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write(QJsonDocument(root).toJson(QJsonDocument::Compact));
+        file.close();
+
+        WuWaDialogueDb db;
+        QVERIFY(db.loadDialogueDb(path));
+        QString out;
+        // Exact.
+        QVERIFY(db.lookupFuzzy(QStringLiteral("Talk to Shilang"), out));
+        QCOMPARE(out, QStringLiteral("Nói chuyện với Shilang"));
+        // OCR punctuation noise: squashed-form exact.
+        QVERIFY(db.lookupFuzzy(QStringLiteral("Talk to Shilang!"), out));
+        QCOMPARE(out, QStringLiteral("Nói chuyện với Shilang"));
+        // One wrong character: Levenshtein ratio 1 - 1/15 >= 0.88.
+        QVERIFY(db.lookupFuzzy(QStringLiteral("Talk to Shilanj"), out));
+        QCOMPARE(out, QStringLiteral("Nói chuyện với Shilang"));
+        // A different line sharing the first two words: no hit.
+        QVERIFY(!db.lookupFuzzy(QStringLiteral("Talk to the vendor"), out));
+        // Empty query: no hit.
+        QVERIFY(!db.lookupFuzzy(QStringLiteral("   "), out));
+        // similarityRatio units.
+        QCOMPARE(WuWaDialogueDb::similarityRatio(QStringLiteral("abc"), QStringLiteral("abc")), 1.0);
+        QVERIFY(qAbs(WuWaDialogueDb::similarityRatio(QStringLiteral("abc"), QStringLiteral("abd"))
+                     - (1.0 - 1.0 / 3.0))
+                < 0.001);
+        QCOMPARE(WuWaDialogueDb::similarityRatio(QString(), QString()), 1.0);
+        QCOMPARE(WuWaDialogueDb::similarityRatio(QStringLiteral("a"), QString()), 0.0);
+    }
+
     void boundedQueueDropsStaleJob()
     {
         TranslationJobQueue queue;

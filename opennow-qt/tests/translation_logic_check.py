@@ -9,6 +9,9 @@ cover, and asserts the same cases:
      pixel bytes; empty for a null/empty image).
   3. TranslationJobQueue -- 1 running + 1 waiting; a new submit replaces
      the waiting job and counts it as dropped-stale.
+  4. WuWaDialogueDb::lookupFuzzy -- exact, then squashed-form exact, then
+     Levenshtein ratio >= 0.88 among entries sharing the first two words.
+     similarityRatio() is the Levenshtein-based ratio.
 
 Run:  python3 opennow-qt/tests/translation_logic_check.py
 Exit code 0 = all checks pass.
@@ -213,6 +216,62 @@ class TranslationJobQueue:
         self.running = None
 
 
+def squash_key(normalized):
+    # Mirrors squashKey(): every non-alphanumeric stripped.
+    return "".join(c for c in normalized if c.isalnum())
+
+
+def levenshtein(a, b):
+    # Two-row Levenshtein, as in WuWaDialogueDb::similarityRatio.
+    n, m = len(a), len(b)
+    prev = list(range(m + 1))
+    cur = [0] * (m + 1)
+    for i in range(1, n + 1):
+        cur[0] = i
+        for j in range(1, m + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev, cur = cur, prev
+    return prev[m]
+
+
+def similarity_ratio(a, b):
+    n, m = len(a), len(b)
+    if n == 0 and m == 0:
+        return 1.0
+    if n == 0 or m == 0:
+        return 0.0
+    return 1.0 - levenshtein(a, b) / max(n, m)
+
+
+def first_two_words(key):
+    # Mirrors WuWaDialogueDb::firstTwoWords: up to the second space.
+    parts = key.split(" ", 2)
+    return " ".join(parts[:2]) if len(parts) >= 2 else key
+
+
+def lookup_fuzzy(entries, text):
+    # Mirrors WuWaDialogueDb::lookupFuzzy over a {normalized key: vi} dict.
+    key = normalize_key(text)
+    if not key:
+        return None
+    if key in entries:
+        return entries[key]
+    sq = squash_key(key)
+    if sq:
+        for k, v in entries.items():
+            if squash_key(k) == sq:
+                return v
+    best, best_ratio = None, 0.0
+    for k, v in entries.items():
+        if first_two_words(k) != first_two_words(key):
+            continue
+        r = similarity_ratio(key, k)
+        if r > best_ratio:
+            best_ratio, best = r, v
+    return best if best_ratio >= 0.88 else None
+
+
 def check(name, cond):
     print(f"{'PASS' if cond else 'FAIL'}  {name}")
     if not cond:
@@ -351,6 +410,21 @@ def main():
           "stream" not in payload and len(content) == 2
           and content[1]["type"] == "image_url"
           and content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
+    # 4. Fuzzy DB lookup (mirrors WuWaDialogueDb::lookupFuzzy + tst_translation).
+    db = {normalize_key("Talk to Shilang"): "Nói chuyện với Shilang",
+          normalize_key("The Rover walks into the city"): "Rover bước vào thành phố",
+          normalize_key("Leave the room and take a look outside"): "Rời khỏi phòng và nhìn ra ngoài"}
+    check("fuzzy exact", lookup_fuzzy(db, "Talk to Shilang") == "Nói chuyện với Shilang")
+    check("fuzzy punctuation noise", lookup_fuzzy(db, "Talk to Shilang!") == "Nói chuyện với Shilang")
+    check("fuzzy one-char typo", lookup_fuzzy(db, "Talk to Shilanj") == "Nói chuyện với Shilang")
+    check("fuzzy different line sharing first words misses",
+          lookup_fuzzy(db, "Talk to the vendor") is None)
+    check("fuzzy empty query misses", lookup_fuzzy(db, "   ") is None)
+    check("similarity identical is 1.0", similarity_ratio("abc", "abc") == 1.0)
+    check("similarity one sub is 2/3", abs(similarity_ratio("abc", "abd") - 2 / 3) < 0.001)
+    check("similarity empty/empty is 1.0", similarity_ratio("", "") == 1.0)
+    check("similarity one empty is 0.0", similarity_ratio("a", "") == 0.0)
 
     print(f"\n{check.failures} failure(s)")
     return 1 if check.failures else 0
