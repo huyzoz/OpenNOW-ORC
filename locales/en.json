@@ -4521,6 +4521,7 @@
       "a_dich": "Đã dịch",
       "a_tai": "Đã tải",
       "a_tai_san_co_so_du_lieu_bat_e_dung_khong_goi_ai_khong_ton_token": "Đã tải sẵn cơ sở dữ liệu — bật để dùng, không gọi AI, không tốn token.",
+      "bat_buoc_dan_key_gemini_hoac_key_custom_api_o_duoi_e_bat": "Bắt buộc: dán key Gemini hoặc key Custom API ở dưới để bật.",
       "cache_ban_dich": "Cache bản dịch",
       "chen_ban_dich_ngay_tai_vung_thoai_che_chu_goc": "Chèn bản dịch ngay tại vùng thoại, che chữ gốc.",
       "chen_tai_cho": "Chèn tại chỗ",
