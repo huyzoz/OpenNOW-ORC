@@ -177,12 +177,19 @@ TranslationEngine::TranslationEngine(QObject *parent)
         m_chunkGame = settings.value(QStringLiteral("translation/chunkGame"),
                                      QStringLiteral("wuthering-waves")).toString();
         m_dialoguePreset = settings.value(QStringLiteral("translation/dialoguePreset"),
-                                          QStringLiteral("wuthering-waves")).toString();
+                                          QStringLiteral("full-screen")).toString();
+        // v4.1 migration: the old shipped default was "wuthering-waves"
+        // (dialogue strip only). A saved value of it is the old default,
+        // not a deliberate choice — migrate it to full-screen once and
+        // persist, so existing installs stop missing all non-dialogue
+        // text. "generic" is a deliberate choice and stays.
+        m_dialoguePreset = migrateDialoguePreset(m_dialoguePreset);
+        saveTranslationSetting(QStringLiteral("dialoguePreset"), m_dialoguePreset);
         const QRectF presetRect = dialogueRectForPreset(m_dialoguePreset);
         if (!presetRect.isNull())
             m_dialogueRect = presetRect;
         else
-            m_dialoguePreset = QStringLiteral("wuthering-waves");
+            m_dialoguePreset = QStringLiteral("full-screen");
         // Clamp anything a hand-edited config file may have corrupted.
         if (m_sourceLanguage.isEmpty())
             m_sourceLanguage = QStringLiteral("en");
@@ -221,14 +228,17 @@ TranslationEngine::TranslationEngine(QObject *parent)
             qWarning() << "TranslationEngine: failed to load bundled font" << font;
     }
     // Chunk mode (v4): catalog strings from the shipped-known values,
-    // worker pointed at the chunk DB, cached chunks loaded when enabled.
+    // worker pointed at the chunk DB, cached chunks loaded. The cache is
+    // loaded ALWAYS (v4.1), not only when chunk mode is on: the Settings
+    // detail card and the download state must reflect what is on disk
+    // even when chunk mode is off — otherwise a downloaded DB still
+    // reads "Chưa tải chunk" and the download button stays live.
     applyChunkCatalog();
     QMetaObject::invokeMethod(m_worker, "setChunkDb", Qt::QueuedConnection,
                               Q_ARG(WuWaDialogueDb *, &m_chunkDb));
     QMetaObject::invokeMethod(m_worker, "setChunkEnabled", Qt::QueuedConnection,
                               Q_ARG(bool, m_chunkEnabled));
-    if (m_chunkEnabled)
-        loadCachedChunks();
+    loadCachedChunks();
     // The pump was restored enabled from QSettings: start it. The
     // frameRequested connect in ApplicationStartup is wired after this
     // constructor returns, and the first timeout is 1s away, so no
@@ -658,6 +668,15 @@ QRectF TranslationEngine::dialogueRectForPreset(const QString &preset)
     return QRectF();
 }
 
+QString TranslationEngine::migrateDialoguePreset(const QString &saved)
+{
+    if (saved == QStringLiteral("generic") || saved == QStringLiteral("full-screen"))
+        return saved;
+    // "wuthering-waves" (the pre-v4.1 shipped default), empty, and
+    // anything unknown all become the current default, full-screen.
+    return QStringLiteral("full-screen");
+}
+
 void TranslationEngine::setDialoguePreset(const QString &preset)
 {
     const QRectF rect = dialogueRectForPreset(preset);
@@ -898,7 +917,11 @@ void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)
     }
     if (result.original.isEmpty() && result.translated.isEmpty()) {
         // OCR found no dialogue text in the crop: nothing to show, and
-        // not an error. Leave the current translation alone.
+        // not an error. Leave the current translation alone, but say so
+        // in the status (v4.1): a silent no-op is indistinguishable from
+        // a dead pipeline, and the status is the only place the user can
+        // tell the pump is running and the crop is simply empty.
+        setStatus(QStringLiteral("No text in scanned area"));
         return;
     }
     m_keepPreviousTimer.stop();

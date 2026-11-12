@@ -59,8 +59,12 @@ class TranslationEngine : public QObject
     Q_PROPERTY(QString lastTranslatedText READ lastTranslatedText NOTIFY translationTextChanged)
     Q_PROPERTY(QString lastOriginalText READ lastOriginalText NOTIFY translationTextChanged)
     Q_PROPERTY(QRectF dialogueRect READ dialogueRect WRITE setDialogueRect NOTIFY dialogueRectChanged)
-    // "wuthering-waves" (dialogue bottom bar), "generic" (lower third),
-    // "full-screen" (whole frame — every line of text, not just dialogue).
+    // "full-screen" (whole frame — every line of text: dialogue, quests,
+    // chat, menus) is the default since v4.1: the old default
+    // "wuthering-waves" (dialogue bottom bar) missed almost all game text,
+    // so users saw no translation at all on quest/voiceline/chat screens.
+    // "generic" is the lower third. migrateDialoguePreset() moves a saved
+    // old default to full-screen (see the .cpp).
     Q_PROPERTY(QString dialoguePreset READ dialoguePreset WRITE setDialoguePreset NOTIFY dialoguePresetChanged)
     Q_PROPERTY(qint64 lastOcrMs READ lastOcrMs NOTIFY translationTextChanged)
     Q_PROPERTY(qint64 lastTranslateMs READ lastTranslateMs NOTIFY translationTextChanged)
@@ -93,6 +97,10 @@ class TranslationEngine : public QObject
     Q_PROPERTY(QString chunkStatus READ chunkStatus NOTIFY chunkStatusChanged)
     Q_PROPERTY(double chunkProgress READ chunkProgress NOTIFY chunkProgressChanged)
     Q_PROPERTY(int chunkDbSize READ chunkDbSize NOTIFY chunkDbSizeChanged)
+    // True once the selected game's chunk files are on disk (downloaded),
+    // regardless of whether chunk mode is currently on. The Settings page
+    // uses it to show "Đã tải" and lock the download button.
+    Q_PROPERTY(bool chunkDownloaded READ chunkDownloaded NOTIFY chunkDbSizeChanged)
     Q_PROPERTY(bool lastChunkHit READ lastChunkHit NOTIFY translationTextChanged)
 
 public:
@@ -134,6 +142,12 @@ public:
     QString dialoguePreset() const { return m_dialoguePreset; }
     // Normalized rect for a preset, or a null rect for an unknown preset.
     static QRectF dialogueRectForPreset(const QString &preset);
+    // Migrates a saved preset to the current default: the old shipped
+    // default "wuthering-waves" becomes "full-screen" (it was never a
+    // deliberate user choice, just the code default); "generic" and
+    // "full-screen" pass through; empty/unknown become "full-screen".
+    // Pure, unit-testable.
+    static QString migrateDialoguePreset(const QString &saved);
     // Converts worker blocks to the QML-facing QVariantList of maps
     // {original, translated, x, y, w, h}. Pure, unit-testable.
     static QVariantList blocksToVariantList(const QList<TranslatedBlock> &blocks);
@@ -171,6 +185,7 @@ public:
     QString chunkStatus() const { return m_chunkStatus; }
     double chunkProgress() const { return m_chunkProgress; }
     int chunkDbSize() const { return m_chunkDb.size(); }
+    bool chunkDownloaded() const { return m_chunkDb.size() > 0; }
     bool lastChunkHit() const { return m_lastChunkHit; }
 
     Q_INVOKABLE void onStreamFrame(const QImage &image);
