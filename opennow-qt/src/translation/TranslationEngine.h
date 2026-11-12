@@ -77,6 +77,23 @@ class TranslationEngine : public QObject
     Q_PROPERTY(QString customApiBase READ customApiBase WRITE setCustomApiBase NOTIFY customApiBaseChanged)
     Q_PROPERTY(QString customApiModel READ customApiModel WRITE setCustomApiModel NOTIFY customApiModelChanged)
     Q_PROPERTY(QStringList customApiModels READ customApiModels NOTIFY customApiModelsChanged)
+    // Chunk mode (v4): translate from the pre-translated chunk database
+    // (repo huyzoz/wuwa-vi-chunks) instead of an AI provider. The DB is
+    // downloaded on demand and cached locally; chunk mode OFF is exactly
+    // the v3 behavior.
+    Q_PROPERTY(bool chunkEnabled READ chunkEnabled WRITE setChunkEnabled NOTIFY chunkEnabledChanged)
+    Q_PROPERTY(QString chunkGame READ chunkGame WRITE setChunkGame NOTIFY chunkGameChanged)
+    Q_PROPERTY(QStringList chunkGames READ chunkGames NOTIFY chunkGameChanged)
+    Q_PROPERTY(QString chunkGameTitle READ chunkGameTitle NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkGameVersion READ chunkGameVersion NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkGameWordsText READ chunkGameWordsText NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkGameStringsText READ chunkGameStringsText NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkTranslatedText READ chunkTranslatedText NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkRepoUrl READ chunkRepoUrl NOTIFY chunkGameInfoChanged)
+    Q_PROPERTY(QString chunkStatus READ chunkStatus NOTIFY chunkStatusChanged)
+    Q_PROPERTY(double chunkProgress READ chunkProgress NOTIFY chunkProgressChanged)
+    Q_PROPERTY(int chunkDbSize READ chunkDbSize NOTIFY chunkDbSizeChanged)
+    Q_PROPERTY(bool lastChunkHit READ lastChunkHit NOTIFY translationTextChanged)
 
 public:
     explicit TranslationEngine(QObject *parent = nullptr);
@@ -136,9 +153,34 @@ public:
     void setCustomApiModel(const QString &model);
     QStringList customApiModels() const { return m_customApiModels; }
 
+    // Chunk mode (v4). chunkGames() is the list of games with a chunk
+    // database; today only Wuthering Waves, built as a list so future
+    // games slot in. The detail strings come from the shipped catalog
+    // until the downloaded manifest refreshes them.
+    bool chunkEnabled() const { return m_chunkEnabled; }
+    void setChunkEnabled(bool enabled);
+    QString chunkGame() const { return m_chunkGame; }
+    void setChunkGame(const QString &game);
+    QStringList chunkGames() const;
+    QString chunkGameTitle() const { return m_chunkGameTitle; }
+    QString chunkGameVersion() const { return m_chunkVersion; }
+    QString chunkGameWordsText() const { return m_chunkGameWordsText; }
+    QString chunkGameStringsText() const { return m_chunkGameStringsText; }
+    QString chunkTranslatedText() const { return m_chunkTranslatedText; }
+    QString chunkRepoUrl() const { return m_chunkRepoUrl; }
+    QString chunkStatus() const { return m_chunkStatus; }
+    double chunkProgress() const { return m_chunkProgress; }
+    int chunkDbSize() const { return m_chunkDb.size(); }
+    bool lastChunkHit() const { return m_lastChunkHit; }
+
     Q_INVOKABLE void onStreamFrame(const QImage &image);
     Q_INVOKABLE void requestTestTranslation(const QString &englishText);
     Q_INVOKABLE void clearCache();
+    // Downloads the chunk database for the selected game (manifest +
+    // chunk files) on the worker thread. Progress arrives via
+    // chunkProgressChanged / chunkStatusChanged; completion reloads the
+    // DB from the local cache.
+    Q_INVOKABLE void downloadChunks();
     Q_INVOKABLE void setGeminiApiKey(const QString &key);
     Q_INVOKABLE bool hasGeminiApiKey() const;
     Q_INVOKABLE void setCustomApiKey(const QString &key);
@@ -172,6 +214,12 @@ signals:
     void customApiBaseChanged();
     void customApiModelChanged();
     void customApiModelsChanged();
+    void chunkEnabledChanged();
+    void chunkGameChanged();
+    void chunkGameInfoChanged();
+    void chunkStatusChanged();
+    void chunkProgressChanged();
+    void chunkDbSizeChanged();
     // Emitted by the frame pump while translation is enabled. Application
     // Startup connects it to NativeStreamRuntime::requestScreenshot(): the
     // screenshotReady signal only fires for an explicit screenshot request,
@@ -185,6 +233,8 @@ private slots:
     void onWorkerJobProgress(const QString &original, const QString &partialTranslated,
                              const QRectF &sourceRect, bool testJob);
     void onWorkerModelsFetched(const QStringList &models, const QString &error);
+    void onChunkDownloadProgress(int done, int total);
+    void onChunkDownloadFinished(const QString &error);
     void onKeepPreviousExpired();
     void onFrameTimerTimeout();
 
@@ -196,12 +246,28 @@ private:
     CustomApiConfig customApiConfig() const;
     // Pushes the current custom-API config to the worker thread (queued).
     void syncCustomApiToWorker();
+    // Loads the downloaded chunk files for the newest cached version
+    // into m_chunkDb (no-op when nothing is cached). Also refreshes the
+    // detail strings from the cached manifest.
+    void loadCachedChunks();
+    void setChunkStatus(const QString &status);
+    // Refreshes the detail-card strings from the shipped-known catalog
+    // for the selected game.
+    void applyChunkCatalog();
+    // Local cache dir for the selected game's chunks:
+    // <CacheLocation>/wuwa-chunks/<game>.
+    QString chunkGameCacheBase() const;
+    // Snaps jittering OCR rects to their previously stable position
+    // (see m_stableRects). Pure on the given blocks except for the
+    // stability bookkeeping.
+    QVariantList applyStableRects(const QVariantList &blocks);
     // Cache-first submit of one stable crop to the worker (shared by the
     // stability-timeout path and the full-screen throttle path).
     void submitCrop(const QImage &crop, const QString &hash, const QRectF &rect);
     void emitTranslation(const QString &original, const QString &translated,
                          const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
-                         bool cacheHit, const QVariantList &blocks = {});
+                         bool cacheHit, const QVariantList &blocks = {},
+                         bool chunkHit = false);
     // Streaming partial: updates last* fields (+ the live overlay, one
     // block over the source rect) or the TEST section only, but never the
     // cache. The final jobCompleted result always replaces it.
@@ -243,6 +309,32 @@ private:
 
     TranslationCache m_cache;
     WuWaDialogueDb m_dialogueDb;
+    // Chunk database (v4): downloaded chunk files, loaded lazily when
+    // chunk mode is on. The worker looks lines up in this instance.
+    WuWaDialogueDb m_chunkDb;
+    bool m_chunkEnabled = false;
+    QString m_chunkGame = QStringLiteral("wuthering-waves");
+    QString m_chunkVersion;
+    QString m_chunkGameTitle = QStringLiteral("Wuthering Waves");
+    QString m_chunkGameWordsText;
+    QString m_chunkGameStringsText;
+    QString m_chunkTranslatedText;
+    QString m_chunkRepoUrl = QStringLiteral("https://github.com/huyzoz/wuwa-vi-chunks");
+    QString m_chunkStatus;
+    double m_chunkProgress = 0.0;
+    bool m_lastChunkHit = false;
+    // Coordinate memory (v4): normalized English line -> last stable
+    // rect + how many consecutive frames agreed with it. A rect that
+    // agrees twice is "stable" and later jitter snaps back to it, so
+    // boxes stop shaking. Placement only; never touches the stream.
+    struct StableRect
+    {
+        QRectF rect;
+        int hits = 1;
+    };
+    static constexpr int MaxStableRects = 200;
+    QHash<QString, StableRect> m_stableRects;
+    QList<QString> m_stableRectOrder; // oldest first; drives eviction
     TranslationWorker *m_worker = nullptr; // no parent: lives in its own thread
 
     QTimer m_stabilityTimer;

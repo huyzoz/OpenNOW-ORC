@@ -22,6 +22,7 @@
 #include <optional>
 
 #include "translation/CustomApi.h"
+#include "translation/WuWaDialogueDb.h"
 
 // One translated line and where it sits on the frame: rect is normalized
 // 0..1 in FULL-FRAME coordinates (the worker maps the OCR block's
@@ -67,6 +68,7 @@ struct TranslationJobResult
     qint64 translateMs = 0;
     QString cropHash;
     bool cacheHit = false; // true when the translation came from cache/DB
+    bool chunkHit = false; // true when EVERY block came from the chunk DB
     QString error;      // safe to show; never contains a key
 };
 Q_DECLARE_METATYPE(TranslationJobResult)
@@ -123,6 +125,17 @@ public slots:
     // back via customApiModelsFetched.
     void fetchCustomApiModels(const QString &base, const QString &apiKey);
     void cancelPending();
+    // Chunk DB (v4): the worker looks OCR'd lines up in this DB (owned
+    // by the engine; lookup is const and mutex-guarded, so sharing the
+    // pointer across threads is safe) before calling any provider.
+    void setChunkDb(WuWaDialogueDb *db);
+    void setChunkEnabled(bool enabled);
+    // Downloads the chunk database: GETs the manifest, then each listed
+    // file one per event-loop turn (queued self-invocation) so OCR and
+    // translate jobs keep running between downloads. Files land in
+    // <cacheDir>/<version>/<relative path>; progress and completion come
+    // back via chunkDownloadProgress / chunkDownloadFinished.
+    void startChunkDownload(const QString &manifestUrl, const QString &cacheDir);
 
 signals:
     void jobCompleted(const TranslationJobResult &result);
@@ -132,9 +145,14 @@ signals:
     void jobProgress(const QString &original, const QString &partialTranslated,
                      const QRectF &sourceRect, bool testJob);
     void customApiModelsFetched(const QStringList &models, const QString &error);
+    void chunkDownloadProgress(int done, int total);
+    // error is empty on success; on partial failure it names the first
+    // file that failed (the files that did download are still usable).
+    void chunkDownloadFinished(const QString &error);
 
 private slots:
     void processNext();
+    void downloadNextChunkFile();
 
 private:
     TranslationJobQueue m_queue;
@@ -142,4 +160,15 @@ private:
     QString m_geminiApiKey; // worker-thread copy; set via queued slot
     CustomApiConfig m_customApi; // worker-thread copy; set via queued slot
     bool m_processing = false; // worker-thread only
+    WuWaDialogueDb *m_chunkDb = nullptr; // engine-owned; lookup only
+    bool m_chunkEnabled = false;
+    // Chunk-download state (worker thread only).
+    QString m_chunkManifestUrl;
+    QString m_chunkBaseUrl; // manifest URL minus "manifest.json"
+    QByteArray m_chunkManifestBody;
+    QString m_chunkVersion;
+    QString m_chunkCacheDir;
+    QStringList m_chunkFiles;
+    int m_chunkIndex = 0;
+    QString m_chunkError;
 };

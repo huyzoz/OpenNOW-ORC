@@ -2,8 +2,14 @@
 
 #include <QCryptographicHash>
 #include <QCoreApplication>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QFontDatabase>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLocale>
 #include <QMetaObject>
 #include <QSettings>
 #include <QStandardPaths>
@@ -22,6 +28,38 @@ constexpr int FullScreenIntervalMs = 2000;
 // the stability gate (400ms) and the full-screen throttle (2s) — for the
 // cost of one texture readback per second.
 constexpr int FramePumpIntervalMs = 1000;
+// Chunk database (v4): local cache root for downloaded chunk files.
+// Layout: <base>/<game>/<version>/manifest.json +
+// <base>/<game>/<version>/chunks/vi_chunk_NNN.json.
+QString chunkCacheBase()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
+        + QStringLiteral("/wuwa-chunks");
+}
+
+// Shipped-known chunk catalog (one game today). The downloaded manifest
+// refreshes version/counts in loadCachedChunks; these values are what
+// the Settings detail card shows before the first download.
+struct ChunkGameCatalogEntry
+{
+    QString id;
+    QString title;
+    QString version;
+    QString repoUrl;
+    QString manifestUrl;
+    int words = 0;
+    int strings = 0;
+};
+
+ChunkGameCatalogEntry chunkCatalogEntry(const QString &id)
+{
+    if (id == QStringLiteral("wuthering-waves"))
+        return {id, QStringLiteral("Wuthering Waves"), QStringLiteral("3.8"),
+                QStringLiteral("https://github.com/huyzoz/wuwa-vi-chunks"),
+                QStringLiteral("https://raw.githubusercontent.com/huyzoz/wuwa-vi-chunks/main/manifest.json"),
+                3133145, 216384};
+    return {};
+}
 
 bool isFullScreenRect(const QRectF &rect)
 {
@@ -92,6 +130,10 @@ TranslationEngine::TranslationEngine(QObject *parent)
             this, &TranslationEngine::onWorkerJobProgress);
     connect(m_worker, &TranslationWorker::customApiModelsFetched,
             this, &TranslationEngine::onWorkerModelsFetched);
+    connect(m_worker, &TranslationWorker::chunkDownloadProgress,
+            this, &TranslationEngine::onChunkDownloadProgress);
+    connect(m_worker, &TranslationWorker::chunkDownloadFinished,
+            this, &TranslationEngine::onChunkDownloadFinished);
     m_worker->start();
     // Gemini key, persisted locally only (QSettings, never in a file we
     // commit, never logged). Restored here so hasGeminiApiKey() is true
@@ -131,6 +173,9 @@ TranslationEngine::TranslationEngine(QObject *parent)
         m_fontSizePx = settings.value(QStringLiteral("translation/fontSizePx"), 22).toInt();
         m_showOriginal = settings.value(QStringLiteral("translation/showOriginal"), false).toBool();
         m_cacheEnabled = settings.value(QStringLiteral("translation/cacheEnabled"), true).toBool();
+        m_chunkEnabled = settings.value(QStringLiteral("translation/chunkEnabled"), false).toBool();
+        m_chunkGame = settings.value(QStringLiteral("translation/chunkGame"),
+                                     QStringLiteral("wuthering-waves")).toString();
         m_dialoguePreset = settings.value(QStringLiteral("translation/dialoguePreset"),
                                           QStringLiteral("wuthering-waves")).toString();
         const QRectF presetRect = dialogueRectForPreset(m_dialoguePreset);
@@ -153,6 +198,8 @@ TranslationEngine::TranslationEngine(QObject *parent)
                          QStringLiteral("custom")}
                  .contains(m_translationProvider))
             m_translationProvider = QStringLiteral("google");
+        if (m_chunkGame != QStringLiteral("wuthering-waves"))
+            m_chunkGame = QStringLiteral("wuthering-waves");
         if (!QStringList{QStringLiteral("inplace"), QStringLiteral("subtitle"), QStringLiteral("off")}
                  .contains(m_overlayMode))
             m_overlayMode = QStringLiteral("inplace");
@@ -162,6 +209,26 @@ TranslationEngine::TranslationEngine(QObject *parent)
     // Sync the (now normalized) custom-API config to the worker.
     if (!m_customApiBase.isEmpty() || !m_customApiKey.isEmpty() || !m_customApiModel.isEmpty())
         syncCustomApiToWorker();
+    // Bundled overlay font (Be Vietnam Pro, SIL OFL 1.1): full Vietnamese
+    // diacritics, game-fitting geometric sans. Loaded here so the
+    // overlay's font.family resolves even on machines without the font
+    // installed; everything else keeps Theme.bodyFont.
+    for (const QString &font : {QStringLiteral(":/fonts/BeVietnamPro-Regular.ttf"),
+                                QStringLiteral(":/fonts/BeVietnamPro-Medium.ttf"),
+                                QStringLiteral(":/fonts/BeVietnamPro-SemiBold.ttf"),
+                                QStringLiteral(":/fonts/BeVietnamPro-Bold.ttf")}) {
+        if (QFontDatabase::addApplicationFont(font) < 0)
+            qWarning() << "TranslationEngine: failed to load bundled font" << font;
+    }
+    // Chunk mode (v4): catalog strings from the shipped-known values,
+    // worker pointed at the chunk DB, cached chunks loaded when enabled.
+    applyChunkCatalog();
+    QMetaObject::invokeMethod(m_worker, "setChunkDb", Qt::QueuedConnection,
+                              Q_ARG(WuWaDialogueDb *, &m_chunkDb));
+    QMetaObject::invokeMethod(m_worker, "setChunkEnabled", Qt::QueuedConnection,
+                              Q_ARG(bool, m_chunkEnabled));
+    if (m_chunkEnabled)
+        loadCachedChunks();
     // The pump was restored enabled from QSettings: start it. The
     // frameRequested connect in ApplicationStartup is wired after this
     // constructor returns, and the first timeout is 1s away, so no
@@ -385,6 +452,192 @@ void TranslationEngine::setCacheEnabled(bool enabled)
     emit cacheEnabledChanged();
 }
 
+QStringList TranslationEngine::chunkGames() const
+{
+    return {QStringLiteral("wuthering-waves")};
+}
+
+void TranslationEngine::applyChunkCatalog()
+{
+    const ChunkGameCatalogEntry entry = chunkCatalogEntry(m_chunkGame);
+    m_chunkGameTitle = entry.title;
+    m_chunkVersion = entry.version;
+    m_chunkRepoUrl = entry.repoUrl;
+    const QLocale vi(QStringLiteral("vi_VN"));
+    m_chunkGameWordsText = vi.toString(entry.words) + QStringLiteral(" từ");
+    m_chunkGameStringsText = vi.toString(entry.strings) + QStringLiteral(" câu");
+    emit chunkGameInfoChanged();
+}
+
+QString TranslationEngine::chunkGameCacheBase() const
+{
+    return chunkCacheBase() + QChar(u'/') + m_chunkGame;
+}
+
+void TranslationEngine::setChunkEnabled(bool enabled)
+{
+    if (m_chunkEnabled == enabled)
+        return;
+    m_chunkEnabled = enabled;
+    saveTranslationSetting(QStringLiteral("chunkEnabled"), enabled);
+    QMetaObject::invokeMethod(m_worker, "setChunkEnabled", Qt::QueuedConnection,
+                              Q_ARG(bool, enabled));
+    if (enabled) {
+        if (m_chunkDb.size() == 0)
+            loadCachedChunks();
+    } else {
+        setChunkStatus(QStringLiteral("Chunk mode off"));
+    }
+    emit chunkEnabledChanged();
+}
+
+void TranslationEngine::setChunkGame(const QString &game)
+{
+    if (game != QStringLiteral("wuthering-waves") || m_chunkGame == game)
+        return;
+    m_chunkGame = game;
+    saveTranslationSetting(QStringLiteral("chunkGame"), game);
+    applyChunkCatalog();
+    if (m_chunkEnabled)
+        loadCachedChunks();
+    emit chunkGameChanged();
+}
+
+void TranslationEngine::downloadChunks()
+{
+    const ChunkGameCatalogEntry entry = chunkCatalogEntry(m_chunkGame);
+    if (entry.manifestUrl.isEmpty()) {
+        setError(QStringLiteral("No chunks for this game"));
+        return;
+    }
+    m_chunkProgress = 0.0;
+    emit chunkProgressChanged();
+    setChunkStatus(QStringLiteral("Downloading chunks…"));
+    QMetaObject::invokeMethod(m_worker, "startChunkDownload", Qt::QueuedConnection,
+                              Q_ARG(QString, entry.manifestUrl),
+                              Q_ARG(QString, chunkGameCacheBase()));
+}
+
+void TranslationEngine::setChunkStatus(const QString &status)
+{
+    if (m_chunkStatus == status)
+        return;
+    m_chunkStatus = status;
+    emit chunkStatusChanged();
+}
+
+void TranslationEngine::loadCachedChunks()
+{
+    const QString base = chunkGameCacheBase();
+    QDir dir(base);
+    const QStringList versions = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    if (versions.isEmpty()) {
+        setChunkStatus(QStringLiteral("Chunk not downloaded — press Download chunks"));
+        return;
+    }
+    const QString version = versions.last();
+    const QString versionDir = base + QChar(u'/') + version;
+    QStringList files;
+    QFile manifestFile(versionDir + QStringLiteral("/manifest.json"));
+    if (manifestFile.open(QIODevice::ReadOnly)) {
+        const QJsonDocument doc = QJsonDocument::fromJson(manifestFile.readAll());
+        manifestFile.close();
+        if (doc.isObject()) {
+            const QJsonObject manifest = doc.object();
+            const int translated = manifest.value(QStringLiteral("translatedStrings")).toInt();
+            const int total = manifest.value(QStringLiteral("uniqueStrings")).toInt();
+            const QLocale vi(QStringLiteral("vi_VN"));
+            if (translated > 0 && total > 0)
+                m_chunkTranslatedText = QStringLiteral("Đã dịch %1 / %2 câu")
+                    .arg(vi.toString(translated), vi.toString(total));
+            for (const QJsonValue &value : manifest.value(QStringLiteral("files")).toArray()) {
+                const QString file = value.toString();
+                if (!file.isEmpty())
+                    files.append(file);
+            }
+        }
+    }
+    if (files.isEmpty()) {
+        // No (readable) manifest: load every chunk file in the dir.
+        QDir chunksDir(versionDir + QStringLiteral("/chunks"));
+        for (const QString &name : chunksDir.entryList({QStringLiteral("*.json")},
+                                                       QDir::Files, QDir::Name))
+            files.append(QStringLiteral("chunks/") + name);
+    }
+    m_chunkDb.clear();
+    for (const QString &file : files)
+        m_chunkDb.loadChunkFile(versionDir + QChar(u'/') + file);
+    m_chunkVersion = version;
+    const QLocale vi(QStringLiteral("vi_VN"));
+    if (m_chunkDb.size() > 0)
+        setChunkStatus(QStringLiteral("Downloaded %1 lines").arg(vi.toString(m_chunkDb.size())));
+    else
+        setChunkStatus(QStringLiteral("Chunk not downloaded — press Download chunks"));
+    emit chunkGameInfoChanged();
+    emit chunkDbSizeChanged();
+}
+
+void TranslationEngine::onChunkDownloadProgress(int done, int total)
+{
+    m_chunkProgress = total > 0 ? static_cast<double>(done) / total : 0.0;
+    setChunkStatus(QStringLiteral("Downloading chunks… %1/%2").arg(done).arg(total));
+    emit chunkProgressChanged();
+}
+
+void TranslationEngine::onChunkDownloadFinished(const QString &error)
+{
+    m_chunkProgress = error.isEmpty() ? 1.0 : 0.0;
+    emit chunkProgressChanged();
+    if (!error.isEmpty()) {
+        setError(error);
+        return;
+    }
+    loadCachedChunks();
+}
+
+QVariantList TranslationEngine::applyStableRects(const QVariantList &blocks)
+{
+    QVariantList out = blocks;
+    for (QVariant &entry : out) {
+        QVariantMap map = entry.toMap();
+        const QString key = TranslationCache::normalizeKey(
+            map.value(QStringLiteral("original")).toString());
+        if (key.isEmpty())
+            continue;
+        const QRectF rect(map.value(QStringLiteral("x")).toDouble(),
+                          map.value(QStringLiteral("y")).toDouble(),
+                          map.value(QStringLiteral("w")).toDouble(),
+                          map.value(QStringLiteral("h")).toDouble());
+        auto it = m_stableRects.find(key);
+        if (it == m_stableRects.end()) {
+            if (m_stableRects.size() >= MaxStableRects && !m_stableRectOrder.isEmpty())
+                m_stableRects.remove(m_stableRectOrder.takeFirst());
+            m_stableRects.insert(key, StableRect{rect, 1});
+            m_stableRectOrder.append(key);
+            continue;
+        }
+        const QRectF stored = it->rect;
+        const bool close = qAbs(rect.x() - stored.x()) < 0.02
+            && qAbs(rect.y() - stored.y()) < 0.02
+            && qAbs(rect.width() - stored.width()) < 0.02
+            && qAbs(rect.height() - stored.height()) < 0.02;
+        if (close) {
+            it->hits += 1;
+            if (it->hits >= 2) {
+                map.insert(QStringLiteral("x"), stored.x());
+                map.insert(QStringLiteral("y"), stored.y());
+                map.insert(QStringLiteral("w"), stored.width());
+                map.insert(QStringLiteral("h"), stored.height());
+                entry = map;
+            }
+        } else {
+            it->rect = rect;
+            it->hits = 1;
+        }
+    }
+    return out;
+}
+
 void TranslationEngine::setDialogueRect(const QRectF &rect)
 {
     const QRectF clamped = clampNormalized(rect);
@@ -544,6 +797,16 @@ void TranslationEngine::requestTestTranslation(const QString &englishText)
         setError(QStringLiteral("Nothing to translate"));
         return;
     }
+    // Chunk DB first (v4): a pre-translated line needs no provider call.
+    if (m_chunkEnabled) {
+        QString chunked;
+        if (m_chunkDb.lookup(text, chunked) || m_chunkDb.lookupFuzzy(text, chunked)) {
+            m_lastChunkHit = true;
+            setTestResult(text, chunked, 0, 0, true);
+            return;
+        }
+    }
+    m_lastChunkHit = false;
     if (m_cacheEnabled) {
         QString cached;
         if (m_dialogueDb.lookup(text, cached) || m_cache.lookup(text, cached)) {
@@ -613,6 +876,7 @@ void TranslationEngine::setPartialTranslation(const QString &original, const QSt
 
 void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)
 {
+    m_lastChunkHit = result.chunkHit;
     if (!result.ok) {
         setError(result.error.isEmpty() ? QStringLiteral("Translation failed") : result.error);
         // A failed TEST job only shows in the TEST section: never touch
@@ -655,7 +919,7 @@ void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)
     m_lastCacheHit = false;
     emitTranslation(result.original, result.translated, result.sourceRect,
                     result.ocrMs, result.translateMs, false,
-                    blocksToVariantList(result.blocks));
+                    blocksToVariantList(result.blocks), result.chunkHit);
 }
 
 void TranslationEngine::onKeepPreviousExpired()
@@ -695,17 +959,18 @@ QVariantList TranslationEngine::singleBlockVariantList(const QString &original,
 
 void TranslationEngine::emitTranslation(const QString &original, const QString &translated,
                                         const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
-                                        bool cacheHit, const QVariantList &blocks)
+                                        bool cacheHit, const QVariantList &blocks, bool chunkHit)
 {
     m_lastOriginalText = original;
     m_lastTranslatedText = translated;
     m_lastOcrMs = ocrMs;
     m_lastTranslateMs = translateMs;
     m_lastCacheHit = cacheHit;
+    m_lastChunkHit = chunkHit;
     m_lastError.clear();
-    m_translationBlocks = blocks.isEmpty()
+    m_translationBlocks = applyStableRects(blocks.isEmpty()
         ? singleBlockVariantList(original, translated, sourceRect)
-        : blocks;
+        : blocks);
     if (!m_hasTranslation) {
         m_hasTranslation = true;
         emit hasTranslationChanged();
