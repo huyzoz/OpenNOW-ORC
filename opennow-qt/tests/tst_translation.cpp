@@ -6,7 +6,9 @@
 #include "translation/TranslationEngine.h"
 #include "translation/TranslationWorker.h"
 #include "translation/WuWaDialogueDb.h"
+#include "translation/CustomApi.h"
 #include "translation/OcrEngine.h"
+#include "translation/TranslationProvider.h"
 
 #include <QColor>
 #include <QFile>
@@ -297,6 +299,130 @@ private slots:
         QCOMPARE(engine.translationBlocks().at(0).toMap()
                      .value(QStringLiteral("translated")).toString(),
                  QStringLiteral("Xin chào thế giới"));
+    }
+
+    void customApiBaseNormalizationCases()
+    {
+        QCOMPARE(normalizeCustomApiBase(QStringLiteral("https://api.openai.com/v1")),
+                 QStringLiteral("https://api.openai.com/v1"));
+        QCOMPARE(normalizeCustomApiBase(QStringLiteral("https://api.openai.com/v1/")),
+                 QStringLiteral("https://api.openai.com/v1"));
+        QCOMPARE(normalizeCustomApiBase(QStringLiteral("https://x.ai/v1/chat/completions")),
+                 QStringLiteral("https://x.ai/v1"));
+        QCOMPARE(normalizeCustomApiBase(QStringLiteral("  https://x.ai/v1/  ")),
+                 QStringLiteral("https://x.ai/v1"));
+        QVERIFY(normalizeCustomApiBase(QString()).isEmpty());
+        QCOMPARE(customApiModelsUrl(QStringLiteral("https://x.ai/v1/")),
+                 QStringLiteral("https://x.ai/v1/models"));
+        QCOMPARE(customApiChatUrl(QStringLiteral("https://x.ai/v1/chat/completions")),
+                 QStringLiteral("https://x.ai/v1/chat/completions"));
+        QVERIFY(customApiModelsUrl(QString()).isEmpty());
+        QVERIFY(customApiChatUrl(QStringLiteral("   ")).isEmpty());
+    }
+
+    void customApiModelsParsing()
+    {
+        QString error;
+        const QByteArray body = R"({"object":"list","data":[{"id":"gpt-4o-mini"},{"id":"llama-3.3-70b"},{"id":"gpt-4o-mini"}]})";
+        const QStringList models = parseCustomApiModels(body, error);
+        QCOMPARE(models.size(), 2); // duplicate removed
+        QCOMPARE(models.at(0), QStringLiteral("gpt-4o-mini"));
+        QCOMPARE(models.at(1), QStringLiteral("llama-3.3-70b"));
+        QVERIFY(error.isEmpty());
+        // Bad bodies: no models.
+        QVERIFY(parseCustomApiModels(QByteArrayLiteral("not json"), error).isEmpty());
+        QVERIFY(!error.isEmpty());
+        QVERIFY(parseCustomApiModels(QByteArrayLiteral("{\"data\":[]}"), error).isEmpty());
+        QVERIFY(parseCustomApiModels(QByteArrayLiteral("{\"data\":[{\"id\":\"\"}]}"), error).isEmpty());
+    }
+
+    void sseStreamTextParsing()
+    {
+        // Two delta events + [DONE].
+        const QByteArray sse =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Xin\"}}]}\n\n"
+            "data: {\"choices\":[{\"delta\":{\"content\":\" chào\"}}]}\n\n"
+            "data: [DONE]\n\n";
+        QCOMPARE(parseSseStreamText(sse), QStringLiteral("Xin chào"));
+        // A chunk split mid-line parses once the buffer is complete; the
+        // partial buffer yields only the complete first event.
+        const QByteArray firstHalf =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Xin\"}}]}\n\ndata: {\"cho";
+        QCOMPARE(parseSseStreamText(firstHalf), QStringLiteral("Xin"));
+        const QByteArray full = firstHalf + "ices\":[{\"delta\":{\"content\":\" chào\"}}]}\n\ndata: [DONE]\n\n";
+        QCOMPARE(parseSseStreamText(full), QStringLiteral("Xin chào"));
+        // Empty / garbage lines are skipped.
+        QCOMPARE(parseSseStreamText(QByteArrayLiteral(": ping\n\ndata: [DONE]\n\n")), QString());
+        // A final full-message event (non-standard servers) is used as-is.
+        QCOMPARE(parseSseStreamText(
+                     QByteArrayLiteral("data: {\"choices\":[{\"message\":{\"content\":\"Rover\"}}]}\n\n")),
+                 QStringLiteral("Rover"));
+    }
+
+    void chatCompletionTextParsing()
+    {
+        QString text;
+        QString error;
+        QVERIFY(parseChatCompletionText(
+            QByteArrayLiteral("{\"choices\":[{\"message\":{\"content\":\"  Xin chào Rover  \"}}]}"),
+            text, error));
+        QCOMPARE(text, QStringLiteral("Xin chào Rover"));
+        // Legacy completions shape.
+        QVERIFY(parseChatCompletionText(
+            QByteArrayLiteral("{\"choices\":[{\"text\":\"Chào\"}]}"), text, error));
+        QCOMPARE(text, QStringLiteral("Chào"));
+        QVERIFY(!parseChatCompletionText(QByteArrayLiteral("{\"choices\":[]}"), text, error));
+        QVERIFY(!parseChatCompletionText(QByteArrayLiteral("not json"), text, error));
+    }
+
+    void chatCompletionPayloadShape()
+    {
+        const QByteArray payload = buildChatCompletionPayload(
+            QStringLiteral("gpt-4o-mini"), QStringLiteral("sys"), QStringLiteral("Hello"), {}, true);
+        const QJsonDocument doc = QJsonDocument::fromJson(payload);
+        QVERIFY(doc.isObject());
+        const QJsonObject obj = doc.object();
+        QCOMPARE(obj.value(QStringLiteral("model")).toString(), QStringLiteral("gpt-4o-mini"));
+        QVERIFY(obj.value(QStringLiteral("stream")).toBool());
+        const QJsonArray messages = obj.value(QStringLiteral("messages")).toArray();
+        QCOMPARE(messages.size(), 2);
+        QCOMPARE(messages.at(0).toObject().value(QStringLiteral("role")).toString(),
+                 QStringLiteral("system"));
+        QCOMPARE(messages.at(1).toObject().value(QStringLiteral("content")).toString(),
+                 QStringLiteral("Hello"));
+        // Vision call: user content is [text part, image_url part].
+        const QByteArray vision = buildChatCompletionPayload(
+            QStringLiteral("gpt-4o"), QStringLiteral("sys"), QStringLiteral("Read."),
+            QStringLiteral("aGVsbG8="), false);
+        const QJsonObject vobj = QJsonDocument::fromJson(vision).object();
+        QVERIFY(!vobj.contains(QStringLiteral("stream")));
+        const QJsonArray vcontent = vobj.value(QStringLiteral("messages")).toArray()
+            .at(1).toObject().value(QStringLiteral("content")).toArray();
+        QCOMPARE(vcontent.size(), 2);
+        QCOMPARE(vcontent.at(1).toObject().value(QStringLiteral("type")).toString(),
+                 QStringLiteral("image_url"));
+        QVERIFY(vcontent.at(1).toObject().value(QStringLiteral("image_url")).toObject()
+                    .value(QStringLiteral("url")).toString()
+                    .startsWith(QStringLiteral("data:image/jpeg;base64,")));
+    }
+
+    void customProviderAndOcrFactory()
+    {
+        const CustomApiConfig config{QStringLiteral("https://x.ai/v1"),
+                                     QStringLiteral("k"), QStringLiteral("m")};
+        QVERIFY(config.isConfigured());
+        QVERIFY(!CustomApiConfig{}.isConfigured());
+        auto provider = createTranslationProvider(QStringLiteral("custom"), {}, config);
+        QVERIFY(provider != nullptr);
+        QCOMPARE(provider->id(), QStringLiteral("custom"));
+        auto ocr = createOcrEngine(QStringLiteral("custom-vision"), {}, config);
+        QVERIFY(ocr != nullptr);
+        QCOMPARE(ocr->id(), QStringLiteral("custom-vision"));
+        QVERIFY(ocr->available());
+        CustomVisionOcrEngine unconfigured;
+        QVERIFY(!unconfigured.available());
+        QVERIFY(createTranslationProvider(QStringLiteral("bogus")) == nullptr);
+        QVERIFY(createOcrEngine(QStringLiteral("bogus")) == nullptr);
     }
 
     void framePumpFiresWhenEnabled()

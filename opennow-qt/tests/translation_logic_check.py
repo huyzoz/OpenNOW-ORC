@@ -75,6 +75,115 @@ def blocks_to_variant_list(blocks):
             for b in blocks]
 
 
+# 4. Custom OpenAI-compatible API (v3): base normalization, /models
+# parsing, SSE stream parsing, chat-completion parsing + payload shape.
+import json
+
+
+def normalize_custom_api_base(base):
+    # Mirrors normalizeCustomApiBase: trim, strip trailing "/", strip a
+    # trailing "/chat/completions".
+    normalized = base.strip()
+    while normalized.endswith("/"):
+        normalized = normalized[:-1]
+    if normalized.endswith("/chat/completions"):
+        normalized = normalized[: -len("/chat/completions")]
+    while normalized.endswith("/"):
+        normalized = normalized[:-1]
+    return normalized
+
+
+def custom_api_models_url(base):
+    normalized = normalize_custom_api_base(base)
+    return normalized + "/models" if normalized else ""
+
+
+def custom_api_chat_url(base):
+    normalized = normalize_custom_api_base(base)
+    return normalized + "/chat/completions" if normalized else ""
+
+
+def parse_custom_api_models(body):
+    # Mirrors parseCustomApiModels: {"data": [{"id": ...}]} in server
+    # order, duplicates removed; (models, error).
+    try:
+        doc = json.loads(body)
+    except (ValueError, TypeError):
+        return [], "Invalid response from API"
+    data = doc.get("data") if isinstance(doc, dict) else None
+    if not data:
+        return [], "API returned no models"
+    models = []
+    for item in data:
+        model_id = (item.get("id") or "").strip() if isinstance(item, dict) else ""
+        if model_id and model_id not in models:
+            models.append(model_id)
+    if not models:
+        return [], "API returned no models"
+    return models, ""
+
+
+def parse_sse_stream_text(sse_bytes):
+    # Mirrors parseSseStreamText: "data: {...}" lines, delta.content
+    # concatenated, "[DONE]" and garbage lines skipped.
+    text = ""
+    for raw_line in sse_bytes.split("\n"):
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            doc = json.loads(payload)
+        except ValueError:
+            continue
+        choices = doc.get("choices") if isinstance(doc, dict) else None
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = (choice.get("delta") or {}).get("content") or ""
+        if not delta:
+            delta = (choice.get("message") or {}).get("content") or ""
+        text += delta
+    return text
+
+
+def parse_chat_completion_text(body):
+    # Mirrors parseChatCompletionText: choices[0].message.content (or
+    # legacy choices[0].text); (text, error).
+    try:
+        doc = json.loads(body)
+    except (ValueError, TypeError):
+        return "", "Invalid response from API"
+    choices = doc.get("choices") if isinstance(doc, dict) else None
+    if not choices:
+        return "", "API returned no result"
+    choice = choices[0]
+    text = ((choice.get("message") or {}).get("content") or "").strip()
+    if not text:
+        text = (choice.get("text") or "").strip()
+    if not text:
+        return "", "API returned empty text"
+    return text, ""
+
+
+def build_chat_completion_payload(model, system_prompt, user_text, image_base64, stream):
+    # Mirrors buildChatCompletionPayload.
+    messages = [{"role": "system", "content": system_prompt}]
+    if not image_base64:
+        messages.append({"role": "user", "content": user_text})
+    else:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": user_text},
+            {"type": "image_url",
+             "image_url": {"url": "data:image/jpeg;base64," + image_base64}}]})
+    body = {"model": model, "messages": messages}
+    if stream:
+        body["stream"] = True
+    return body
+
+
 class TranslationJobQueue:
     """Mirrors TranslationJobQueue: 1 running + 1 waiting, newest wins."""
 
@@ -188,6 +297,60 @@ def main():
           q.take_running() == "third")
     q.finish_running()
     check("queue drains to empty", q.take_running() is None)
+
+    # 4. Custom API (v3): base normalization, model list, SSE, payload.
+    check("base normalization keeps a clean base",
+          normalize_custom_api_base("https://api.openai.com/v1") == "https://api.openai.com/v1")
+    check("base normalization strips trailing slash",
+          normalize_custom_api_base("https://api.openai.com/v1/") == "https://api.openai.com/v1")
+    check("base normalization strips /chat/completions",
+          normalize_custom_api_base("https://x.ai/v1/chat/completions") == "https://x.ai/v1")
+    check("base normalization trims whitespace",
+          normalize_custom_api_base("  https://x.ai/v1/  ") == "https://x.ai/v1")
+    check("base normalization empty -> empty",
+          normalize_custom_api_base("") == "")
+    check("models url appends /models",
+          custom_api_models_url("https://x.ai/v1/") == "https://x.ai/v1/models")
+    check("chat url appends /chat/completions",
+          custom_api_chat_url("https://x.ai/v1/chat/completions") == "https://x.ai/v1/chat/completions")
+    check("models url empty base -> empty",
+          custom_api_models_url("") == "")
+    models, err = parse_custom_api_models(
+        '{"object":"list","data":[{"id":"gpt-4o-mini"},{"id":"llama-3.3-70b"},{"id":"gpt-4o-mini"}]}')
+    check("models parsed in order, duplicates removed",
+          models == ["gpt-4o-mini", "llama-3.3-70b"] and err == "")
+    models, err = parse_custom_api_models("not json")
+    check("models bad json -> empty + error", models == [] and err != "")
+    models, err = parse_custom_api_models('{"data":[]}')
+    check("models empty data -> empty + error", models == [] and err != "")
+    sse = ('data: {"choices":[{"delta":{"content":"Xin"}}]}\n\n'
+           'data: {"choices":[{"delta":{"content":" chào"}}]}\n\n'
+           'data: [DONE]\n\n')
+    check("SSE deltas concatenate", parse_sse_stream_text(sse) == "Xin chào")
+    check("SSE partial buffer yields only the complete event",
+          parse_sse_stream_text('data: {"choices":[{"delta":{"content":"Xin"}}]}\n\ndata: {"cho') == "Xin")
+    check("SSE garbage lines skipped",
+          parse_sse_stream_text(": ping\n\ndata: [DONE]\n\n") == "")
+    check("SSE full-message event used as-is",
+          parse_sse_stream_text('data: {"choices":[{"message":{"content":"Rover"}}]}\n\n') == "Rover")
+    text, err = parse_chat_completion_text(
+        '{"choices":[{"message":{"content":"  Xin chào Rover  "}}]}')
+    check("chat completion content trimmed", text == "Xin chào Rover" and err == "")
+    text, err = parse_chat_completion_text('{"choices":[{"text":"Chào"}]}')
+    check("chat completion legacy text shape", text == "Chào")
+    text, err = parse_chat_completion_text('{"choices":[]}')
+    check("chat completion no choices -> error", text == "" and err != "")
+    payload = build_chat_completion_payload("gpt-4o-mini", "sys", "Hello", "", True)
+    check("payload text call shape",
+          payload["model"] == "gpt-4o-mini" and payload["stream"] is True
+          and payload["messages"][0]["role"] == "system"
+          and payload["messages"][1]["content"] == "Hello")
+    payload = build_chat_completion_payload("gpt-4o", "sys", "Read.", "aGVsbG8=", False)
+    content = payload["messages"][1]["content"]
+    check("payload vision call has image_url part",
+          "stream" not in payload and len(content) == 2
+          and content[1]["type"] == "image_url"
+          and content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
 
     print(f"\n{check.failures} failure(s)")
     return 1 if check.failures else 0
