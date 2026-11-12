@@ -540,3 +540,67 @@ cause: `tst_translation.cpp` used `QJsonArray` with no
 `#include <QJsonArray>` (C2079 on MSVC, lines 387/399). App code
 compiled; only the new test file failed. Fix: add the include (plus
 `<QStringList>` as the same class of insurance) and re-dispatch.
+
+## v4 — Chunk mode + white frosted overlay (2026-11-12, local, NOT dispatched yet)
+
+Translation batch finished 2026-11-12 14:47: 54/55 chunks PASSED (0
+semantic flags) + chunk 043 partial (1,000/4,000, valid JSON) merged by
+merge_vi.py → vi_multi_38.json: 338,677/342,381 entries translated
+(98.92%); 3,704 entries still English, all from chunk 043's remaining
+3,000 strings. A finisher is translating those 3,000 strings in parallel
+(100-item slices); if it passes before the chunk-repo upload, re-run
+gen_client_chunks.py and the manifest counts refresh. Client chunk files
+(55 × {"version":1,"entries":{en:vi}}, ~43 MB, largest 1.9 MB) generated
+by gen_client_chunks.py into ~/workspace/wuwa-vi-translation/client_chunks/
++ manifest.json (game 3.8, 213,384/216,384 strings, 3,042,056/3,133,145
+words). Upload to huyzoz/wuwa-vi-chunks (browser only, 2 commits: root
+manifest+README, chunks/ 55 files) is in progress.
+
+Client changes (this branch, local commit pending):
+- WuWaDialogueDb: loadChunkFile() merges chunk files without clearing;
+  lookupFuzzy() = exact → squashed-form exact → Levenshtein ratio >= 0.88
+  among entries sharing the first two words (first-two-words + squashed
+  indexes, rebuilt on load; O(1) squashed lookup, tiny candidate sets).
+  clear() added. similarityRatio() is a pure two-row Levenshtein.
+- TranslationWorker: chunk DB pointer + enabled flag (queued slots);
+  processNext looks every OCR block up in the DB first (exact, then
+  fuzzy); only misses go to the provider (joined call, same split-back
+  + per-block fallback as before, merged into reading order); all-hit
+  jobs create NO provider at all (translateMs = 0, chunkHit = true).
+  Partials suppressed when any line already came from the DB.
+  startChunkDownload() GETs the manifest, then each listed file one per
+  event-loop turn (queued self-invocation) so jobs keep running between
+  downloads; files land in <cache>/<game>/<version>/ + manifest.json.
+- TranslationEngine: chunk Q_PROPERTYs (chunkEnabled/chunkGame/chunkGames/
+  chunkGameTitle/chunkGameVersion/chunkGameWordsText/chunkGameStringsText/
+  chunkTranslatedText/chunkRepoUrl/chunkStatus/chunkProgress/chunkDbSize/
+  lastChunkHit), persisted in QSettings translation/chunkEnabled|Game
+  (never ShellStore). downloadChunks() → worker; onChunkDownloadFinished
+  reloads the DB from the cache. requestTestTranslation checks the chunk
+  DB first. Coordinate memory: a line whose OCR rect agrees twice
+  (tolerance 0.02) snaps later jitter back to the stored rect (placement
+  only, capped at 200 lines). Bundled Be Vietnam Pro (Regular/Medium/
+  SemiBold/Bold, OFL) loaded via QFontDatabase in the ctor; resource
+  block /fonts added to Resources.cmake.
+- Overlay: TranslationBox is now WHITE frosted glass — live blur of the
+  video behind it (ShaderEffectSource + MultiEffect blur+mask, rounded
+  corners) under a white tint, dark #1a1a2e text in Be Vietnam Pro.
+  No video item → plain translucent white box (never black). Status pill
+  is white too, and shows "Chunk hit" when the last translation came
+  from the DB. DesktopStreamScreen passes videoItem: streamVideo.
+- Settings: new CHUNK panel (after CUSTOM API): Dịch Chunk toggle,
+  Game choice (only Wuthering Waves now, built as a list), detail rows
+  (version, translated count, words, status, Download button, GitHub
+  link via Qt.openUrlExternally). 14 new strings in locales/en.json
+  (2357 texts, locales:check exit 0).
+- Tests: 3 new C++ slots (chunk merge without clearing + missing/invalid
+  file handling, clear(), fuzzy lookup incl. typo/punctuation/no-match
+  + similarityRatio units) and 9 new python-mirror checks (53 checks,
+  0 failures). No new C++ files, so Sources.cmake/Tests.cmake are
+  untouched; no workflow changes.
+
+Still NOT proven live: chunk download + DB lookup on the real app,
+frosted-blur cost on the HD 4400 (the white base still covers the text
+even if the blur layer fails), glyph rendering of Be Vietnam Pro in the
+overlay, and the chunk-043 remainder (finisher pending). CI is the
+compiler: dispatch on huyzoz gh-runners, watch every 5 min.
