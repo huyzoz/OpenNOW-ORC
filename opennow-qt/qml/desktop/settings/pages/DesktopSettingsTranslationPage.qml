@@ -50,6 +50,10 @@ Column {
         && String(translationEngine.customApiBase || "") !== ""
         && page.customKeySaved
         && String(translationEngine.customApiModel || "") !== ""
+    // True once the selected game's chunk files are on disk (downloaded),
+    // regardless of whether chunk mode is on. Drives the "Đã tải" button
+    // state and the toggle hint below.
+    readonly property bool chunkDownloaded: page.hasEngine && translationEngine.chunkDownloaded === true
     // Model dropdown items: the live list from {base}/models when
     // fetched, otherwise just the currently saved model (or a hint).
     readonly property var customModelItems: {
@@ -145,13 +149,13 @@ Column {
         DesktopSettingsChoice {
             objectName: "translationDialoguePreset"
             width: parent.width; glyph: "image"; title: qsTr("Vùng thoại")
-            description: qsTr("Vùng màn hình lấy chữ để dịch. Vùng thoại tuỳ chỉnh sẽ có ở bản sau; hiện chỉ chọn preset.")
+            description: qsTr("Vùng màn hình lấy chữ để dịch. Toàn màn hình dịch mọi chữ: thoại, nhiệm vụ, chat, menu.")
             items: [
-                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("Vùng thoại dưới màn hình · mặc định")},
-                {label: qsTr("Generic"), value: "generic", detail: qsTr("Vùng thoại chung")},
-                {label: qsTr("Toàn màn hình"), value: "full-screen", detail: qsTr("Toàn bộ màn hình")}
+                {label: qsTr("Toàn màn hình"), value: "full-screen", detail: qsTr("Mặc định · dịch mọi chữ trên màn hình")},
+                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("Chỉ vùng thoại dưới màn hình")},
+                {label: qsTr("Generic"), value: "generic", detail: qsTr("Vùng thoại chung")}
             ]
-            value: page.hasEngine ? String(translationEngine.dialoguePreset || "wuthering-waves") : "wuthering-waves"
+            value: page.hasEngine ? String(translationEngine.dialoguePreset || "full-screen") : "full-screen"
             onSelected: value => { if (page.hasEngine) translationEngine.setDialoguePreset(value) }
         }
         DesktopSettingsRow {
@@ -305,7 +309,9 @@ Column {
         DesktopSettingsSection { text: qsTr("CHUNK") }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "controller"; title: qsTr("Dịch Chunk")
-            description: qsTr("Dịch bằng cơ sở dữ liệu Việt hoá sẵn — không gọi AI, không tốn token, hiện ngay. Tắt = dịch bằng provider đang chọn.")
+            description: page.chunkDownloaded
+                ? qsTr("Đã tải sẵn cơ sở dữ liệu — bật để dùng, không gọi AI, không tốn token.")
+                : qsTr("Dịch bằng cơ sở dữ liệu Việt hoá sẵn — không gọi AI, không tốn token, hiện ngay. Tắt = dịch bằng provider đang chọn.")
             showDivider: false
             DesktopSettingsToggle {
                 objectName: "translationChunkToggle"
@@ -348,8 +354,8 @@ Column {
             DesktopSettingsButton {
                 objectName: "translationChunkDownloadButton"
                 compact: true
-                enabled: page.hasEngine
-                text: qsTr("Tải chunk")
+                enabled: page.hasEngine && !page.chunkDownloaded
+                text: page.chunkDownloaded ? qsTr("Đã tải") : qsTr("Tải chunk")
                 onClicked: { if (page.hasEngine) translationEngine.downloadChunks() }
             }
         }
