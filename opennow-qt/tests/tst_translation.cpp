@@ -327,7 +327,6 @@ private slots:
     }
 
     void dialoguePresetRects()
-    void migrateDialoguePresetCases()
     {
         QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("wuthering-waves")),
                  QRectF(0.05, 0.72, 0.90, 0.24));
@@ -356,6 +355,19 @@ private slots:
                  QStringLiteral("full-screen"));
         QCOMPARE(TranslationEngine::migrateDialoguePreset(QStringLiteral("bogus")),
                  QStringLiteral("full-screen"));
+    }
+
+    void chunkDownloadCompleteCases()
+    {
+        // v5: "downloaded" means the DB holds the full set the manifest
+        // promises — a partial cache is NOT downloaded, and an unknown
+        // expected count (no manifest on disk) is never complete.
+        QVERIFY(!TranslationEngine::isChunkDownloadComplete(0, 0));
+        QVERIFY(!TranslationEngine::isChunkDownloadComplete(0, 220764));
+        QVERIFY(!TranslationEngine::isChunkDownloadComplete(220763, 220764));
+        QVERIFY(TranslationEngine::isChunkDownloadComplete(220764, 220764));
+        QVERIFY(TranslationEngine::isChunkDownloadComplete(220765, 220764));
+        QVERIFY(!TranslationEngine::isChunkDownloadComplete(5, 0));
     }
 
     void mapBlockRectToFrameCases()

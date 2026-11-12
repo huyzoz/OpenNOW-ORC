@@ -68,6 +68,13 @@ def migrate_dialogue_preset(saved):
     return "full-screen"
 
 
+def is_chunk_download_complete(db_size, expected_strings):
+    # Mirrors TranslationEngine::isChunkDownloadComplete (v5): complete
+    # iff the manifest promises at least one string and the DB holds at
+    # least that many. expected == 0 means unknown, never complete.
+    return expected_strings > 0 and db_size >= expected_strings
+
+
 def map_block_rect_to_frame(block, source):
     # Mirrors mapBlockRectToFrame: an OCR block's rect (0..1 within the
     # crop) into full-frame coords through the crop's source rect, clamped.
@@ -344,6 +351,20 @@ def main():
           migrate_dialogue_preset("") == "full-screen")
     check("migrate unknown -> full-screen",
           migrate_dialogue_preset("bogus") == "full-screen")
+
+    # v5 chunk completeness mirrors TranslationEngine::isChunkDownloadComplete.
+    check("chunk complete: empty/unknown -> False",
+          is_chunk_download_complete(0, 0) is False)
+    check("chunk complete: empty/expected -> False",
+          is_chunk_download_complete(0, 220764) is False)
+    check("chunk complete: one short -> False",
+          is_chunk_download_complete(220763, 220764) is False)
+    check("chunk complete: exact -> True",
+          is_chunk_download_complete(220764, 220764) is True)
+    check("chunk complete: over -> True",
+          is_chunk_download_complete(220765, 220764) is True)
+    check("chunk complete: unknown expected -> False",
+          is_chunk_download_complete(5, 0) is False)
 
     # 2b. Block rect mapping mirrors mapBlockRectToFrame (v2 per-line overlay).
     def near(a, b):
