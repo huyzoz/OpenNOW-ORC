@@ -88,6 +88,10 @@ TranslationEngine::TranslationEngine(QObject *parent)
 
     connect(m_worker, &TranslationWorker::jobCompleted,
             this, &TranslationEngine::onWorkerJobCompleted);
+    connect(m_worker, &TranslationWorker::jobProgress,
+            this, &TranslationEngine::onWorkerJobProgress);
+    connect(m_worker, &TranslationWorker::customApiModelsFetched,
+            this, &TranslationEngine::onWorkerModelsFetched);
     m_worker->start();
     // Gemini key, persisted locally only (QSettings, never in a file we
     // commit, never logged). Restored here so hasGeminiApiKey() is true
@@ -98,6 +102,11 @@ TranslationEngine::TranslationEngine(QObject *parent)
         if (!m_geminiApiKey.isEmpty())
             QMetaObject::invokeMethod(m_worker, "setGeminiApiKey", Qt::QueuedConnection,
                                       Q_ARG(QString, m_geminiApiKey));
+        // Custom API config, same rules: local only, never logged.
+        // Synced to the worker after the validation block below.
+        m_customApiBase = settings.value(QStringLiteral("translation/customApiBase")).toString();
+        m_customApiKey = settings.value(QStringLiteral("translation/customApiKey")).toString();
+        m_customApiModel = settings.value(QStringLiteral("translation/customApiModel")).toString();
     }
     // Translation settings are persisted by THIS engine in QSettings
     // (translation/<key>), never through ShellStore.settings: the Rust
@@ -134,11 +143,14 @@ TranslationEngine::TranslationEngine(QObject *parent)
             m_sourceLanguage = QStringLiteral("en");
         if (m_targetLanguage.isEmpty())
             m_targetLanguage = QStringLiteral("vi");
+        m_customApiBase = normalizeCustomApiBase(m_customApiBase);
         if (!QStringList{QStringLiteral("gemini-vision"), QStringLiteral("tesseract"),
-                         QStringLiteral("rapidocr"), QStringLiteral("windows-ocr")}
+                         QStringLiteral("rapidocr"), QStringLiteral("windows-ocr"),
+                         QStringLiteral("custom-vision")}
                  .contains(m_ocrEngine))
             m_ocrEngine = QStringLiteral("gemini-vision");
-        if (!QStringList{QStringLiteral("google"), QStringLiteral("gemini")}
+        if (!QStringList{QStringLiteral("google"), QStringLiteral("gemini"),
+                         QStringLiteral("custom")}
                  .contains(m_translationProvider))
             m_translationProvider = QStringLiteral("google");
         if (!QStringList{QStringLiteral("inplace"), QStringLiteral("subtitle"), QStringLiteral("off")}
@@ -147,6 +159,9 @@ TranslationEngine::TranslationEngine(QObject *parent)
         m_stabilityDelayMs = qBound(0, m_stabilityDelayMs, 5000);
         m_fontSizePx = qBound(10, m_fontSizePx, 64);
     }
+    // Sync the (now normalized) custom-API config to the worker.
+    if (!m_customApiBase.isEmpty() || !m_customApiKey.isEmpty() || !m_customApiModel.isEmpty())
+        syncCustomApiToWorker();
     // The pump was restored enabled from QSettings: start it. The
     // frameRequested connect in ApplicationStartup is wired after this
     // constructor returns, and the first timeout is 1s away, so no
@@ -232,7 +247,8 @@ void TranslationEngine::setTargetLanguage(const QString &language)
 void TranslationEngine::setOcrEngine(const QString &engine)
 {
     static const QStringList valid = {QStringLiteral("gemini-vision"), QStringLiteral("tesseract"),
-                                      QStringLiteral("rapidocr"), QStringLiteral("windows-ocr")};
+                                      QStringLiteral("rapidocr"), QStringLiteral("windows-ocr"),
+                                      QStringLiteral("custom-vision")};
     if (!valid.contains(engine) || m_ocrEngine == engine)
         return;
     m_ocrEngine = engine;
@@ -242,12 +258,82 @@ void TranslationEngine::setOcrEngine(const QString &engine)
 
 void TranslationEngine::setTranslationProvider(const QString &provider)
 {
-    static const QStringList valid = {QStringLiteral("google"), QStringLiteral("gemini")};
+    static const QStringList valid = {QStringLiteral("google"), QStringLiteral("gemini"),
+                                      QStringLiteral("custom")};
     if (!valid.contains(provider) || m_translationProvider == provider)
         return;
     m_translationProvider = provider;
     saveTranslationSetting(QStringLiteral("translationProvider"), provider);
     emit translationProviderChanged();
+}
+
+CustomApiConfig TranslationEngine::customApiConfig() const
+{
+    return CustomApiConfig{m_customApiBase, m_customApiKey, m_customApiModel};
+}
+
+void TranslationEngine::syncCustomApiToWorker()
+{
+    QMetaObject::invokeMethod(m_worker, "setCustomApiConfig", Qt::QueuedConnection,
+                              Q_ARG(CustomApiConfig, customApiConfig()));
+}
+
+void TranslationEngine::setCustomApiBase(const QString &base)
+{
+    const QString normalized = normalizeCustomApiBase(base);
+    if (m_customApiBase == normalized)
+        return;
+    m_customApiBase = normalized;
+    saveTranslationSetting(QStringLiteral("customApiBase"), normalized);
+    syncCustomApiToWorker();
+    emit customApiBaseChanged();
+}
+
+void TranslationEngine::setCustomApiModel(const QString &model)
+{
+    const QString trimmed = model.trimmed();
+    if (m_customApiModel == trimmed)
+        return;
+    m_customApiModel = trimmed;
+    saveTranslationSetting(QStringLiteral("customApiModel"), trimmed);
+    syncCustomApiToWorker();
+    emit customApiModelChanged();
+}
+
+void TranslationEngine::setCustomApiKey(const QString &key)
+{
+    if (m_customApiKey == key)
+        return;
+    m_customApiKey = key;
+    // Persist locally only (QSettings: registry on Windows, ini elsewhere).
+    // Never written to the repo, never logged, never sent anywhere except
+    // to the user's own base in the Authorization header.
+    QSettings settings;
+    if (key.isEmpty())
+        settings.remove(QStringLiteral("translation/customApiKey"));
+    else
+        settings.setValue(QStringLiteral("translation/customApiKey"), key);
+    syncCustomApiToWorker();
+}
+
+bool TranslationEngine::hasCustomApiKey() const
+{
+    return !m_customApiKey.isEmpty();
+}
+
+void TranslationEngine::fetchCustomApiModels()
+{
+    if (m_customApiBase.isEmpty()) {
+        setError(QStringLiteral("Custom API base URL is empty"));
+        return;
+    }
+    if (m_customApiKey.isEmpty()) {
+        setError(QStringLiteral("Custom API key is empty"));
+        return;
+    }
+    setStatus(QStringLiteral("Fetching models…"));
+    QMetaObject::invokeMethod(m_worker, "fetchCustomApiModels", Qt::QueuedConnection,
+                              Q_ARG(QString, m_customApiBase), Q_ARG(QString, m_customApiKey));
 }
 
 void TranslationEngine::setOverlayMode(const QString &mode)
@@ -431,6 +517,7 @@ void TranslationEngine::submitCrop(const QImage &crop, const QString &hash, cons
     job.sourceLanguage = m_sourceLanguage;
     job.targetLanguage = m_targetLanguage;
     job.geminiApiKey = m_geminiApiKey;
+    job.customApi = customApiConfig();
     setStatus(QStringLiteral("Reading dialogue…"));
     QMetaObject::invokeMethod(m_worker, "submitJob", Qt::QueuedConnection,
                               Q_ARG(TranslationJob, job));
@@ -473,9 +560,55 @@ void TranslationEngine::requestTestTranslation(const QString &englishText)
     job.sourceLanguage = m_sourceLanguage;
     job.targetLanguage = m_targetLanguage;
     job.geminiApiKey = m_geminiApiKey;
+    job.customApi = customApiConfig();
     setStatus(QStringLiteral("Translating…"));
     QMetaObject::invokeMethod(m_worker, "submitJob", Qt::QueuedConnection,
                               Q_ARG(TranslationJob, job));
+}
+
+void TranslationEngine::onWorkerJobProgress(const QString &original,
+                                            const QString &partialTranslated,
+                                            const QRectF &sourceRect, bool testJob)
+{
+    setPartialTranslation(original, partialTranslated, sourceRect, testJob);
+}
+
+void TranslationEngine::onWorkerModelsFetched(const QStringList &models, const QString &error)
+{
+    if (!error.isEmpty()) {
+        setError(error);
+        return;
+    }
+    m_customApiModels = models;
+    emit customApiModelsChanged();
+    if (m_customApiModel.isEmpty() && !models.isEmpty())
+        setCustomApiModel(models.first());
+    setStatus(QStringLiteral("Fetched %1 models").arg(models.size()));
+}
+
+void TranslationEngine::setPartialTranslation(const QString &original, const QString &partial,
+                                              const QRectF &sourceRect, bool testJob)
+{
+    // Streaming partial: updates the visible text as it arrives, but
+    // never the cache — only the final jobCompleted result is cached.
+    // A TEST partial stays in the TEST section, like setTestResult.
+    m_lastOriginalText = original;
+    m_lastTranslatedText = partial;
+    m_lastError.clear();
+    setStatus(QStringLiteral("Translating…"));
+    if (testJob) {
+        emit translationTextChanged();
+        return;
+    }
+    // Live overlay: one block over the source rect for now; the final
+    // result replaces it with one box per English line.
+    m_translationBlocks = singleBlockVariantList(original, partial, sourceRect);
+    if (!m_hasTranslation) {
+        m_hasTranslation = true;
+        emit hasTranslationChanged();
+    }
+    emit translationBlocksChanged();
+    emit translationTextChanged();
 }
 
 void TranslationEngine::onWorkerJobCompleted(const TranslationJobResult &result)

@@ -1,18 +1,26 @@
 // TranslationProvider: English -> Vietnamese translation.
 //
-// Both implementations run on the translation worker thread (never the GUI
+// All implementations run on the translation worker thread (never the GUI
 // thread) and are synchronous with an internal timeout (see
 // TranslationHttp::NetworkTimeoutMs, 8s, single 429 retry).
 //
 //  - GoogleTranslateProvider: REAL, free unauthenticated endpoint
 //    (translate.googleapis.com/translate_a/single?client=gtx). No key.
-//  - GeminiTranslateProvider: REAL, Gemini 2.5 Flash-Lite with a fixed
+//  - GeminiTranslateProvider: REAL, Gemini 3.5 Flash-Lite with a fixed
 //    Wuthering Waves prompt (keeps proper names, Rover pronouns, natural
 //    Vietnamese). Key is passed in, never logged, never stored in code.
+//  - CustomApiTranslateProvider: REAL, any OpenAI-compatible base the
+//    user pastes (OpenAI, OpenRouter, Groq, DeepSeek, ...). The model
+//    list comes from GET {base}/models with the user's key, and the
+//    translation streams (SSE) so partial text shows while the model is
+//    still generating instead of waiting for the whole reply.
 #pragma once
 
 #include <QString>
+#include <functional>
 #include <memory>
+
+#include "translation/CustomApi.h"
 
 struct TranslateResult
 {
@@ -20,6 +28,11 @@ struct TranslateResult
     QString text;  // Vietnamese translation on success
     QString error; // human-readable, safe to show; never contains a key
 };
+
+// Called with the progressively translated text while a streaming
+// provider is still generating. The final text is always delivered
+// through translateStreaming's return value as well.
+using TranslateChunkCallback = std::function<void(const QString &partialText)>;
 
 class TranslationProvider
 {
@@ -30,6 +43,13 @@ public:
     virtual TranslateResult translate(const QString &englishText,
                                       const QString &sourceLanguage,
                                       const QString &targetLanguage) = 0;
+    // Streaming translation. The default implementation calls
+    // translate() once and reports the whole text as a single chunk, so
+    // non-streaming providers work unchanged through this path.
+    virtual TranslateResult translateStreaming(const QString &englishText,
+                                               const QString &sourceLanguage,
+                                               const QString &targetLanguage,
+                                               const TranslateChunkCallback &onChunk);
 };
 
 class GoogleTranslateProvider final : public TranslationProvider
@@ -57,7 +77,28 @@ private:
     QString m_apiKey; // never logged, never written to disk by this class
 };
 
-// Factory. `geminiApiKey` is forwarded only to GeminiTranslateProvider.
+class CustomApiTranslateProvider final : public TranslationProvider
+{
+public:
+    explicit CustomApiTranslateProvider(const CustomApiConfig &config = {});
+    void setConfig(const CustomApiConfig &config); // key held in memory only
+    QString id() const override { return QStringLiteral("custom"); }
+    QString displayName() const override { return QStringLiteral("Custom API"); }
+    TranslateResult translate(const QString &englishText,
+                              const QString &sourceLanguage,
+                              const QString &targetLanguage) override;
+    TranslateResult translateStreaming(const QString &englishText,
+                                       const QString &sourceLanguage,
+                                       const QString &targetLanguage,
+                                       const TranslateChunkCallback &onChunk) override;
+
+private:
+    CustomApiConfig m_config; // base + key + model; key never logged
+};
+
+// Factory. `geminiApiKey` is forwarded only to GeminiTranslateProvider;
+// `customApi` only to CustomApiTranslateProvider.
 // Returns nullptr for an unknown id.
-std::unique_ptr<TranslationProvider> createTranslationProvider(const QString &id,
-                                                               const QString &geminiApiKey = {});
+std::unique_ptr<TranslationProvider> createTranslationProvider(
+    const QString &id, const QString &geminiApiKey = {},
+    const CustomApiConfig &customApi = {});

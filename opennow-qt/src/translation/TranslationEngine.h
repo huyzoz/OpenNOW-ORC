@@ -17,7 +17,10 @@
 //      no network at all.
 //   5. Otherwise a job goes to TranslationWorker (own thread): OCR with
 //      the selected engine, then translate with the selected provider,
-//      then insert into the cache and emit translationReady.
+//      then insert into the cache and emit translationReady. Streaming
+//      providers (custom API) also report partial text through
+//      jobProgress while generating, so the overlay fills in live; the
+//      final jobCompleted result always replaces the partial.
 // All network/OCR work happens in the worker thread; the GUI thread never
 // blocks. On failure lastError is set, the previous translation is kept
 // for 2s, and no garbage text is ever emitted.
@@ -34,6 +37,7 @@
 #include <QTimer>
 #include <QVariant>
 
+#include "translation/CustomApi.h"
 #include "translation/TranslationCache.h"
 #include "translation/TranslationWorker.h"
 #include "translation/WuWaDialogueDb.h"
@@ -67,6 +71,12 @@ class TranslationEngine : public QObject
     // with x/y/w/h normalized 0..1 in full-frame coordinates. The overlay
     // draws one box per entry, over the English line it replaces.
     Q_PROPERTY(QVariantList translationBlocks READ translationBlocks NOTIFY translationBlocksChanged)
+    // Custom OpenAI-compatible API (any base + key + model the user
+    // pastes). The key itself is write-only through setCustomApiKey();
+    // QML only ever reads whether one is saved.
+    Q_PROPERTY(QString customApiBase READ customApiBase WRITE setCustomApiBase NOTIFY customApiBaseChanged)
+    Q_PROPERTY(QString customApiModel READ customApiModel WRITE setCustomApiModel NOTIFY customApiModelChanged)
+    Q_PROPERTY(QStringList customApiModels READ customApiModels NOTIFY customApiModelsChanged)
 
 public:
     explicit TranslationEngine(QObject *parent = nullptr);
@@ -120,12 +130,23 @@ public:
     QString lastError() const { return m_lastError; }
     bool hasTranslation() const { return m_hasTranslation; }
     QVariantList translationBlocks() const { return m_translationBlocks; }
+    QString customApiBase() const { return m_customApiBase; }
+    void setCustomApiBase(const QString &base);
+    QString customApiModel() const { return m_customApiModel; }
+    void setCustomApiModel(const QString &model);
+    QStringList customApiModels() const { return m_customApiModels; }
 
     Q_INVOKABLE void onStreamFrame(const QImage &image);
     Q_INVOKABLE void requestTestTranslation(const QString &englishText);
     Q_INVOKABLE void clearCache();
     Q_INVOKABLE void setGeminiApiKey(const QString &key);
     Q_INVOKABLE bool hasGeminiApiKey() const;
+    Q_INVOKABLE void setCustomApiKey(const QString &key);
+    Q_INVOKABLE bool hasCustomApiKey() const;
+    // Lists the models of the configured custom base (GET {base}/models
+    // with the saved key). Result arrives via customApiModelsChanged /
+    // statusText; the model list itself is never persisted.
+    Q_INVOKABLE void fetchCustomApiModels();
     // "wuthering-waves" (dialogue bottom bar) or "generic" (lower third).
     Q_INVOKABLE void setDialoguePreset(const QString &preset);
 
@@ -148,6 +169,9 @@ signals:
     void dialoguePresetChanged();
     void hasTranslationChanged();
     void translationBlocksChanged();
+    void customApiBaseChanged();
+    void customApiModelChanged();
+    void customApiModelsChanged();
     // Emitted by the frame pump while translation is enabled. Application
     // Startup connects it to NativeStreamRuntime::requestScreenshot(): the
     // screenshotReady signal only fires for an explicit screenshot request,
@@ -158,18 +182,31 @@ signals:
 private slots:
     void onStabilityTimeout();
     void onWorkerJobCompleted(const TranslationJobResult &result);
+    void onWorkerJobProgress(const QString &original, const QString &partialTranslated,
+                             const QRectF &sourceRect, bool testJob);
+    void onWorkerModelsFetched(const QStringList &models, const QString &error);
     void onKeepPreviousExpired();
     void onFrameTimerTimeout();
 
 private:
     void setStatus(const QString &status);
     void setError(const QString &error);
+    // Current custom-API config for jobs (key never leaves this class
+    // except into a job / the worker, and is never logged).
+    CustomApiConfig customApiConfig() const;
+    // Pushes the current custom-API config to the worker thread (queued).
+    void syncCustomApiToWorker();
     // Cache-first submit of one stable crop to the worker (shared by the
     // stability-timeout path and the full-screen throttle path).
     void submitCrop(const QImage &crop, const QString &hash, const QRectF &rect);
     void emitTranslation(const QString &original, const QString &translated,
                          const QRectF &sourceRect, qint64 ocrMs, qint64 translateMs,
                          bool cacheHit, const QVariantList &blocks = {});
+    // Streaming partial: updates last* fields (+ the live overlay, one
+    // block over the source rect) or the TEST section only, but never the
+    // cache. The final jobCompleted result always replaces it.
+    void setPartialTranslation(const QString &original, const QString &partial,
+                               const QRectF &sourceRect, bool testJob);
     // TEST-section only: updates last* fields + status, but never touches
     // the live overlay (hasTranslation / translationBlocks /
     // translationReady). A "Dịch thử" result must never stick on the
@@ -199,6 +236,10 @@ private:
     QString m_lastError;
     bool m_hasTranslation = false;
     QString m_geminiApiKey; // persisted locally via QSettings only; never logged, never committed
+    QString m_customApiBase; // persisted locally via QSettings only
+    QString m_customApiKey;  // persisted locally via QSettings only; never logged, never committed
+    QString m_customApiModel; // persisted locally via QSettings only
+    QStringList m_customApiModels; // fetched live from {base}/models; never persisted
 
     TranslationCache m_cache;
     WuWaDialogueDb m_dialogueDb;

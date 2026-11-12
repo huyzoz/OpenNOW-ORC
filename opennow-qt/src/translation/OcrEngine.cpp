@@ -33,32 +33,10 @@ QString geminiUrl()
         + QString::fromLatin1(GeminiModel) + QStringLiteral(":generateContent");
 }
 
-// Parses the model's JSON reply out of the Gemini response envelope.
 // Strips ```json fences if the model added them despite the prompt.
-// Fills text (blocks joined with "\n") and blocks (one per line, rect
-// normalized 0..1 within the image, clamped and empty/zero-area blocks
-// dropped). Accepts the old {"text": ...} shape as one whole-image block.
-bool parseGeminiOcrText(const QByteArray &body, QString &text, QList<OcrBlock> &blocks,
-                        double &confidence, QString &error)
+QString stripCodeFences(QString raw)
 {
-    const QJsonDocument doc = QJsonDocument::fromJson(body);
-    if (!doc.isObject()) {
-        error = QStringLiteral("Invalid response from OCR service");
-        return false;
-    }
-    const QJsonArray candidates = doc.object().value(QStringLiteral("candidates")).toArray();
-    if (candidates.isEmpty()) {
-        error = QStringLiteral("OCR service returned no result");
-        return false;
-    }
-    const QJsonArray parts = candidates.at(0).toObject()
-        .value(QStringLiteral("content")).toObject()
-        .value(QStringLiteral("parts")).toArray();
-    if (parts.isEmpty()) {
-        error = QStringLiteral("OCR service returned no text");
-        return false;
-    }
-    QString raw = parts.at(0).toObject().value(QStringLiteral("text")).toString().trimmed();
+    raw = raw.trimmed();
     if (raw.startsWith(QStringLiteral("```"))) {
         const int firstNewline = raw.indexOf(QChar(u'\n'));
         if (firstNewline >= 0)
@@ -67,6 +45,17 @@ bool parseGeminiOcrText(const QByteArray &body, QString &text, QList<OcrBlock> &
             raw.chop(3);
         raw = raw.trimmed();
     }
+    return raw;
+}
+
+// Parses the model's JSON reply ({"blocks": [...], "confidence": n} or
+// the old {"text": ...} shape) into per-line blocks. Shared by Gemini
+// Vision and the custom vision engine: both prompts ask for the same
+// shape, so the envelope is the only thing that differs.
+bool parseOcrBlocksJson(const QString &rawText, QString &text, QList<OcrBlock> &blocks,
+                        double &confidence, QString &error)
+{
+    const QString raw = stripCodeFences(rawText);
     const QJsonDocument inner = QJsonDocument::fromJson(raw.toUtf8());
     if (!inner.isObject()) {
         error = QStringLiteral("OCR service returned unparsable text");
@@ -103,6 +92,34 @@ bool parseGeminiOcrText(const QByteArray &body, QString &text, QList<OcrBlock> &
         lines.append(block.text);
     text = lines.join(QChar(u'\n'));
     return true;
+}
+
+// Parses the model's JSON reply out of the Gemini response envelope.
+// Fills text (blocks joined with "\n") and blocks (one per line, rect
+// normalized 0..1 within the image, clamped and empty/zero-area blocks
+// dropped). Accepts the old {"text": ...} shape as one whole-image block.
+bool parseGeminiOcrText(const QByteArray &body, QString &text, QList<OcrBlock> &blocks,
+                        double &confidence, QString &error)
+{
+    const QJsonDocument doc = QJsonDocument::fromJson(body);
+    if (!doc.isObject()) {
+        error = QStringLiteral("Invalid response from OCR service");
+        return false;
+    }
+    const QJsonArray candidates = doc.object().value(QStringLiteral("candidates")).toArray();
+    if (candidates.isEmpty()) {
+        error = QStringLiteral("OCR service returned no result");
+        return false;
+    }
+    const QJsonArray parts = candidates.at(0).toObject()
+        .value(QStringLiteral("content")).toObject()
+        .value(QStringLiteral("parts")).toArray();
+    if (parts.isEmpty()) {
+        error = QStringLiteral("OCR service returned no text");
+        return false;
+    }
+    const QString raw = parts.at(0).toObject().value(QStringLiteral("text")).toString().trimmed();
+    return parseOcrBlocksJson(raw, text, blocks, confidence, error);
 }
 } // namespace
 
@@ -161,6 +178,62 @@ OcrResult GeminiVisionOcrEngine::recognize(const QImage &image)
     double confidence = -1.0;
     QString error;
     if (!parseGeminiOcrText(result.body, text, blocks, confidence, error))
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, error};
+    return OcrResult{OcrResult::Status::Ok, text, blocks, confidence, {}};
+}
+
+CustomVisionOcrEngine::CustomVisionOcrEngine(const CustomApiConfig &config)
+    : m_config(config)
+{
+}
+
+void CustomVisionOcrEngine::setConfig(const CustomApiConfig &config)
+{
+    m_config = config;
+}
+
+OcrResult CustomVisionOcrEngine::recognize(const QImage &image)
+{
+    if (!m_config.isConfigured())
+        return OcrResult{OcrResult::Status::NotAvailable, {}, {}, -1.0,
+                         QStringLiteral("Custom API not configured: set base URL, API key and model")};
+    if (image.isNull() || image.width() <= 0 || image.height() <= 0)
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
+                         QStringLiteral("Empty image passed to OCR")};
+
+    QByteArray jpeg;
+    {
+        QBuffer buffer(&jpeg);
+        buffer.open(QIODevice::WriteOnly);
+        // JPEG quality 90: small payload, text stays legible.
+        if (!image.convertedTo(QImage::Format_RGB32).save(&buffer, "JPG", 90))
+            return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0,
+                             QStringLiteral("Could not encode image for OCR")};
+    }
+
+    // Same blocks-JSON prompt as Gemini Vision, sent as the system
+    // message; the image travels as a base64 data URL in the user message.
+    const QByteArray payload = buildChatCompletionPayload(
+        m_config.model, QString::fromLatin1(GeminiOcrPrompt),
+        QStringLiteral("Read the text in this image."), QString::fromLatin1(jpeg.toBase64()),
+        false);
+    // Key travels in the Authorization header, never in the URL, and is
+    // never logged.
+    const TranslationHttpResult result = TranslationHttp::postJson(
+        customApiChatUrl(m_config.baseUrl), payload,
+        {{QByteArrayLiteral("Authorization"),
+          QByteArrayLiteral("Bearer ") + m_config.apiKey.toUtf8()}});
+    if (!result.ok())
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, result.error};
+
+    QString rawText;
+    QString error;
+    if (!parseChatCompletionText(result.body, rawText, error))
+        return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, error};
+    QString text;
+    QList<OcrBlock> blocks;
+    double confidence = -1.0;
+    if (!parseOcrBlocksJson(rawText, text, blocks, confidence, error))
         return OcrResult{OcrResult::Status::Failed, {}, {}, -1.0, error};
     return OcrResult{OcrResult::Status::Ok, text, blocks, confidence, {}};
 }
@@ -296,10 +369,13 @@ OcrResult WindowsOcrEngine::recognize(const QImage &)
                                     "package identity, which this Win32 build does not have")};
 }
 
-std::unique_ptr<OcrEngine> createOcrEngine(const QString &id, const QString &geminiApiKey)
+std::unique_ptr<OcrEngine> createOcrEngine(const QString &id, const QString &geminiApiKey,
+                                           const CustomApiConfig &customApi)
 {
     if (id == QStringLiteral("gemini-vision"))
         return std::make_unique<GeminiVisionOcrEngine>(geminiApiKey);
+    if (id == QStringLiteral("custom-vision"))
+        return std::make_unique<CustomVisionOcrEngine>(customApi);
     if (id == QStringLiteral("tesseract"))
         return std::make_unique<TesseractOcrEngine>();
     if (id == QStringLiteral("rapidocr"))

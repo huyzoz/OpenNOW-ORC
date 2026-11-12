@@ -12,6 +12,7 @@
 #include <QList>
 #include <QPair>
 #include <QString>
+#include <functional>
 
 struct TranslationHttpResult
 {
@@ -26,6 +27,8 @@ class TranslationHttp
 public:
     static constexpr int NetworkTimeoutMs = 8000;
     static constexpr int MaxRetryAfterMs = 10000;
+    // Hard cap on one streaming response, even while chunks keep coming.
+    static constexpr int MaxStreamTotalMs = 60000;
 
     // Synchronous request on the calling thread. `headers` are raw
     // name/value pairs (e.g. {"Content-Type", "application/json"}).
@@ -46,4 +49,17 @@ public:
         all.append({QByteArrayLiteral("Content-Type"), QByteArrayLiteral("application/json")});
         return request(QStringLiteral("POST"), url, all, jsonBody);
     }
+
+    // Synchronous streaming POST (SSE): `onChunk` is invoked with each
+    // batch of response bytes AS IT ARRIVES, so the caller can show
+    // partial text while the model is still generating. The 8s timeout
+    // is INACTIVITY-based — the clock restarts on every chunk — and the
+    // whole stream is capped at MaxStreamTotalMs. Like request(), a 429
+    // retries exactly once. The returned `body` holds only bytes that
+    // arrived after the last readyRead (normally empty: chunks go to
+    // `onChunk`); check `error` / `statusCode` as usual.
+    static TranslationHttpResult postStream(
+        const QString &url, const QByteArray &jsonBody,
+        const QList<QPair<QByteArray, QByteArray>> &headers,
+        const std::function<void(const QByteArray &chunk)> &onChunk);
 };

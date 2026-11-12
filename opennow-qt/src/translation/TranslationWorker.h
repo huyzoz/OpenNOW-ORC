@@ -21,6 +21,8 @@
 #include <QThread>
 #include <optional>
 
+#include "translation/CustomApi.h"
+
 // One translated line and where it sits on the frame: rect is normalized
 // 0..1 in FULL-FRAME coordinates (the worker maps the OCR block's
 // crop-relative rect through the job's sourceRect), so the overlay can draw
@@ -47,6 +49,7 @@ struct TranslationJob
     QString sourceLanguage = QStringLiteral("en");
     QString targetLanguage = QStringLiteral("vi");
     QString geminiApiKey;   // forwarded to Gemini engines; never logged
+    CustomApiConfig customApi; // forwarded to custom engines; key never logged
 };
 Q_DECLARE_METATYPE(TranslationJob)
 
@@ -114,10 +117,21 @@ public slots:
     // bounded queue; a stale waiting job is dropped, never processed late.
     void submitJob(const TranslationJob &job);
     void setGeminiApiKey(const QString &key);
+    void setCustomApiConfig(const CustomApiConfig &config);
+    // Lists the models of a custom base (GET {base}/models, key in the
+    // Authorization header). Runs in the worker thread; the result comes
+    // back via customApiModelsFetched.
+    void fetchCustomApiModels(const QString &base, const QString &apiKey);
     void cancelPending();
 
 signals:
     void jobCompleted(const TranslationJobResult &result);
+    // A streaming provider's partial translation (emitted from the worker
+    // thread, queued to the GUI thread). The final text always arrives
+    // through jobCompleted afterwards; partials are never cached.
+    void jobProgress(const QString &original, const QString &partialTranslated,
+                     const QRectF &sourceRect, bool testJob);
+    void customApiModelsFetched(const QStringList &models, const QString &error);
 
 private slots:
     void processNext();
@@ -126,5 +140,6 @@ private:
     TranslationJobQueue m_queue;
     QThread m_thread;
     QString m_geminiApiKey; // worker-thread copy; set via queued slot
+    CustomApiConfig m_customApi; // worker-thread copy; set via queued slot
     bool m_processing = false; // worker-thread only
 };

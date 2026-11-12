@@ -1,5 +1,7 @@
 #include "translation/TranslationWorker.h"
+#include "translation/CustomApi.h"
 #include "translation/OcrEngine.h"
+#include "translation/TranslationHttp.h"
 #include "translation/TranslationProvider.h"
 
 #include <QElapsedTimer>
@@ -85,6 +87,7 @@ TranslationWorker::TranslationWorker(QObject *parent)
     qRegisterMetaType<TranslationJob>();
     qRegisterMetaType<TranslationJobResult>();
     qRegisterMetaType<TranslatedBlock>();
+    qRegisterMetaType<CustomApiConfig>();
 }
 
 TranslationWorker::~TranslationWorker()
@@ -125,6 +128,12 @@ void TranslationWorker::submitJob(const TranslationJob &job)
     TranslationJob effective = job;
     if (effective.geminiApiKey.isEmpty())
         effective.geminiApiKey = m_geminiApiKey;
+    if (effective.customApi.baseUrl.isEmpty())
+        effective.customApi.baseUrl = m_customApi.baseUrl;
+    if (effective.customApi.apiKey.isEmpty())
+        effective.customApi.apiKey = m_customApi.apiKey;
+    if (effective.customApi.model.isEmpty())
+        effective.customApi.model = m_customApi.model;
     m_queue.submit(effective);
     if (!m_processing)
         QMetaObject::invokeMethod(this, "processNext", Qt::QueuedConnection);
@@ -134,6 +143,38 @@ void TranslationWorker::setGeminiApiKey(const QString &key)
 {
     // Runs in the worker thread; the key is never logged.
     m_geminiApiKey = key;
+}
+
+void TranslationWorker::setCustomApiConfig(const CustomApiConfig &config)
+{
+    // Runs in the worker thread; the key is never logged.
+    m_customApi = config;
+}
+
+void TranslationWorker::fetchCustomApiModels(const QString &base, const QString &apiKey)
+{
+    // Runs in the worker thread. Lists the base's real models
+    // (GET {base}/models, key in the Authorization header); the result
+    // comes back via customApiModelsFetched.
+    const QString url = customApiModelsUrl(base);
+    if (url.isEmpty()) {
+        emit customApiModelsFetched({}, QStringLiteral("Custom API base URL is empty"));
+        return;
+    }
+    if (apiKey.isEmpty()) {
+        emit customApiModelsFetched({}, QStringLiteral("Custom API key is empty"));
+        return;
+    }
+    const TranslationHttpResult result = TranslationHttp::request(
+        QStringLiteral("GET"), url,
+        {{QByteArrayLiteral("Authorization"), QByteArrayLiteral("Bearer ") + apiKey.toUtf8()}});
+    if (!result.ok()) {
+        emit customApiModelsFetched({}, result.error);
+        return;
+    }
+    QString error;
+    const QStringList models = parseCustomApiModels(result.body, error);
+    emit customApiModelsFetched(models, error);
 }
 
 void TranslationWorker::cancelPending()
@@ -183,7 +224,7 @@ void TranslationWorker::processNext()
             if (tried.contains(candidateId))
                 continue;
             tried.append(candidateId);
-            auto engine = createOcrEngine(candidateId, job->geminiApiKey);
+            auto engine = createOcrEngine(candidateId, job->geminiApiKey, job->customApi);
             if (!engine)
                 continue;
             if (!engine->available())
@@ -234,7 +275,7 @@ void TranslationWorker::processNext()
 
     QElapsedTimer translateTimer;
     translateTimer.start();
-    auto provider = createTranslationProvider(job->providerId, job->geminiApiKey);
+    auto provider = createTranslationProvider(job->providerId, job->geminiApiKey, job->customApi);
     if (!provider) {
         result.error = QStringLiteral("Unknown translation provider");
         result.ocrMs = ocrMs;
@@ -249,8 +290,14 @@ void TranslationWorker::processNext()
     // split the reply back onto the same blocks. If the reply has a
     // different number of lines, fall back to one call per block — the
     // position mapping must never be guessed from a misaligned split.
-    const TranslateResult translated =
-        provider->translate(original, job->sourceLanguage, job->targetLanguage);
+    // Streaming providers report partial text through the callback as it
+    // arrives (emitted as jobProgress); the final text still comes back
+    // here and replaces the partial.
+    const TranslateResult translated = provider->translateStreaming(
+        original, job->sourceLanguage, job->targetLanguage,
+        [&](const QString &partial) {
+            emit jobProgress(original, partial, job->sourceRect, job->testJob);
+        });
     result.translateMs = translateTimer.elapsed();
     result.ocrMs = ocrMs;
     if (!translated.ok) {
