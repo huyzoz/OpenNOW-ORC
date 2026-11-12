@@ -295,6 +295,79 @@ Column {
         }
     }
 
+    // (d3) Dịch Chunk — pre-translated database (v4). When ON, OCR'd
+    // lines are looked up in the downloaded chunk database first (no AI
+    // call, no tokens); misses fall back to the provider above. The
+    // detail card shows the selected game's chunk info; the game list is
+    // built for future games.
+    DesktopSettingsPanel {
+        width: parent.width; paperStyle: true
+        DesktopSettingsSection { text: qsTr("CHUNK") }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "controller"; title: qsTr("Dịch Chunk")
+            description: qsTr("Dịch bằng cơ sở dữ liệu Việt hoá sẵn — không gọi AI, không tốn token, hiện ngay. Tắt = dịch bằng provider đang chọn.")
+            showDivider: false
+            DesktopSettingsToggle {
+                objectName: "translationChunkToggle"
+                checked: page.hasEngine && translationEngine.chunkEnabled
+                Accessible.name: qsTr("Dịch Chunk")
+                onValueChangedByUser: value => { if (page.hasEngine) translationEngine.chunkEnabled = value }
+            }
+        }
+        DesktopSettingsChoice {
+            objectName: "translationChunkGame"
+            width: parent.width; glyph: "controller"; title: qsTr("Game")
+            description: qsTr("Game dùng chunk Việt hoá sẵn. Hiện chỉ có Wuthering Waves; game khác sẽ thêm sau.")
+            items: [
+                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("3.8 · Lilies in a Dying Dream")}
+            ]
+            value: page.hasEngine ? String(translationEngine.chunkGame || "wuthering-waves") : "wuthering-waves"
+            onSelected: value => { if (page.hasEngine) translationEngine.chunkGame = value }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Phiên bản chunk")
+            description: page.hasEngine ? String(translationEngine.chunkGameVersion || "") : ""
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Đã dịch")
+            description: page.hasEngine && String(translationEngine.chunkTranslatedText || "") !== ""
+                ? String(translationEngine.chunkTranslatedText)
+                : qsTr("Chưa tải — bấm Tải chunk để xem")
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Từ vựng")
+            description: page.hasEngine ? String(translationEngine.chunkGameWordsText || "") : ""
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Trạng thái")
+            description: page.hasEngine ? String(translationEngine.chunkStatus || qsTr("Chưa tải chunk")) : qsTr("Chưa tải chunk")
+            showDivider: false
+            DesktopSettingsButton {
+                objectName: "translationChunkDownloadButton"
+                compact: true
+                enabled: page.hasEngine
+                text: qsTr("Tải chunk")
+                onClicked: { if (page.hasEngine) translationEngine.downloadChunks() }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Kho chunk")
+            description: qsTr("Mã nguồn dữ liệu chunk trên GitHub.")
+            showDivider: false
+            Text {
+                text: "<a href=\"" + (page.hasEngine ? String(translationEngine.chunkRepoUrl || "") : "") + "\">huyzoz/wuwa-vi-chunks</a>"
+                color: Theme.label
+                linkColor: Theme.focus
+                font.family: Theme.bodyFont
+                font.pixelSize: DesktopTokens.bodySize
+                onLinkActivated: link => Qt.openUrlExternally(link)
+            }
+        }
+    }
+
     // (e) Hiển thị
     DesktopSettingsPanel {
         width: parent.width; paperStyle: true
