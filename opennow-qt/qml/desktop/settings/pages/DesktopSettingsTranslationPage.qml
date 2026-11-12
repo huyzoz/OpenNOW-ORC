@@ -73,11 +73,14 @@ Column {
         DesktopSettingsSection { text: qsTr("TRANSLATION") }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Dịch màn hình")
-            description: qsTr("Nhận diện chữ tiếng Anh trên màn hình stream rồi dịch sang tiếng Việt. Tắt = đúng bản gốc 100%.")
+            description: (page.hasEngine && !translationEngine.visionKeyConfigured)
+                ? qsTr("Bắt buộc: dán key Gemini hoặc key Custom API ở dưới để bật.")
+                : qsTr("Nhận diện chữ tiếng Anh trên màn hình stream rồi dịch sang tiếng Việt. Tắt = đúng bản gốc 100%.")
             showDivider: false
             DesktopSettingsToggle {
                 objectName: "translationEnabledToggle"
                 checked: page.hasEngine && translationEngine.enabled
+                enabled: page.hasEngine && translationEngine.visionKeyConfigured
                 Accessible.name: qsTr("Dịch màn hình")
                 onValueChangedByUser: value => { if (page.hasEngine) translationEngine.enabled = value }
             }
