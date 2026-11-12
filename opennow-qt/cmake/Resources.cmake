@@ -24,6 +24,23 @@ qt_add_resources(opennow-qt "opennow-translation-data"
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/translation/data/wuwa-dialogue-db.json"
 )
 
+# VN translation: bundled Be Vietnam Pro (SIL OFL 1.1, see
+# src/translation/data/fonts/OFL.txt) for the overlay. Full Vietnamese
+# diacritics, game-fitting geometric sans; TranslationEngine loads it
+# via QFontDatabase so the overlay font resolves even on machines
+# without the font installed.
+file(GLOB OPENNOW_TRANSLATION_FONT_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/translation/data/fonts/*.ttf")
+foreach(OPENNOW_TRANSLATION_FONT_FILE IN LISTS OPENNOW_TRANSLATION_FONT_FILES)
+    get_filename_component(OPENNOW_TRANSLATION_FONT_NAME "${OPENNOW_TRANSLATION_FONT_FILE}" NAME)
+    set_source_files_properties("${OPENNOW_TRANSLATION_FONT_FILE}" PROPERTIES
+        QT_RESOURCE_ALIAS "${OPENNOW_TRANSLATION_FONT_NAME}")
+endforeach()
+qt_add_resources(opennow-qt "opennow-translation-fonts"
+    PREFIX "/fonts"
+    FILES ${OPENNOW_TRANSLATION_FONT_FILES}
+)
+
 set(OPENNOW_STREAM_SHADERS
     shaders/streamvideo.vert shaders/streamvideo.frag
     shaders/hdroutput.frag
