@@ -604,3 +604,54 @@ frosted-blur cost on the HD 4400 (the white base still covers the text
 even if the blur layer fails), glyph rendering of Be Vietnam Pro in the
 overlay, and the chunk-043 remainder (finisher pending). CI is the
 compiler: dispatch on huyzoz gh-runners, watch every 5 min.
+
+## v4.1 — full-screen default + honest chunk state (2026-11-12, live-test failure fix)
+
+Live test of v4 (run #53, Ethan 17:48, 4 screenshots: Terminal/profile,
+Character Voicelines, Quests "A Bouquet for Tomorrow", WavesLine chat):
+NO translation on any screen, no error shown. Code read after the fact
+found the causes — the pipeline itself (frame pump → screenshot → OCR →
+chunk DB → overlay) was wired correctly; the failure was upstream of it:
+
+1. DEFAULT CROP MISSED ALL THE TEXT (main cause). The shipped default
+   preset "wuthering-waves" crops only the bottom dialogue strip
+   (0.05, 0.72, 0.90, 0.24). All four test screens put their text
+   outside that strip (quest description, voicelines, chat bubbles,
+   profile) → OCR returned empty → the engine silently kept the old
+   state. The full-screen preset existed but sat third in the dropdown
+   and Ethan's saved preset was the old default. Fix: default preset
+   is now "full-screen" (whole frame: dialogue, quests, chat, menus);
+   a saved "wuthering-waves" is migrated to "full-screen" once at
+   startup (it was the code default, never a deliberate choice;
+   "generic" is kept as-is, the strip stays selectable in Settings).
+   New pure helper TranslationEngine::migrateDialoguePreset() with a
+   C++ slot + 5 python-mirror checks.
+2. CHUNK STATUS LIED WHEN CHUNK MODE WAS OFF. loadCachedChunks() only
+   ran when chunkEnabled was true, so with the toggle off the panel
+   still read "Chưa tải chunk" after a successful download, and the
+   "Tải chunk" button stayed enabled forever. Fix: cached chunks load
+   on every startup; new chunkDownloaded Q_PROPERTY (DB size > 0);
+   the button shows "Đã tải" and disables once downloaded; the Dịch
+   Chunk toggle description says "Đã tải sẵn cơ sở dữ liệu — bật để
+   dùng…" when the DB is on disk.
+3. SILENT NO-TEXT. An OCR job that found no text left the status at
+   "Translation ready" — indistinguishable from a dead pipeline. Fix:
+   the status now reads "No text in scanned area" when a job returns
+   empty (proves the pump runs and the crop is simply empty).
+
+Also corrected here: the chunk DB is 100% (finisher chunk 043 PASSED
+15:41, vi_multi_38.json 342,381/342,381, chunk repo huyzoz/wuwa-vi-chunks
+manifest 216,384 strings) — the v4 note above saying "chunk-043
+remainder (finisher pending)" is stale.
+
+Changes (6 files, local checks green — python mirror 58 checks 0
+failures, locales:check 2359 texts exit 0): TranslationEngine.h/.cpp,
+DesktopSettingsTranslationPage.qml, locales/en.json (+5 strings, −2
+orphaned: the old preset description and detail), tst_translation.cpp
+(+1 slot), translation_logic_check.py (+5 checks). No new C++ files;
+Sources.cmake/Tests.cmake untouched; no workflow changes.
+
+Still NOT proven live: any translation on the real app (needs the new
+build), chunk download + DB lookup on the real app, frosted-blur cost
+on the HD 4400, glyph rendering. Also still open: Ethan's answers on
+toggle state / saved key / status text from the v4 live test.
