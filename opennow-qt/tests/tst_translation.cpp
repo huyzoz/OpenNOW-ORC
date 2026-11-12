@@ -13,10 +13,12 @@
 #include <QColor>
 #include <QFile>
 #include <QImage>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QSignalSpy>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QVariant>
