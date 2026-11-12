@@ -386,6 +386,7 @@ if(BUILD_TESTING)
         src/translation/TranslationCache.cpp src/translation/TranslationCache.h
         src/translation/WuWaDialogueDb.cpp src/translation/WuWaDialogueDb.h
         src/translation/TranslationHttp.cpp src/translation/TranslationHttp.h
+        src/translation/CustomApi.cpp src/translation/CustomApi.h
         src/translation/OcrEngine.cpp src/translation/OcrEngine.h
         src/translation/TranslationProvider.cpp src/translation/TranslationProvider.h
         src/translation/TranslationWorker.cpp src/translation/TranslationWorker.h
@@ -1565,6 +1566,7 @@ if(BUILD_TESTING)
         opennow-controllertuning-tests
         opennow-controllersources-tests
         opennow-controllermetadata-tests
+        opennow-translation-tests
     )
     if(TARGET opennow-nativeframegeneration-tests)
         list(APPEND OPENNOW_CI_UNIT_TEST_TARGETS opennow-nativeframegeneration-tests)

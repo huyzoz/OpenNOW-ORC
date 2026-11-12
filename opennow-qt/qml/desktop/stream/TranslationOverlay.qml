@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import OpenNOW
 
 // Translation overlay: renders the live EN -> VI translation above the stream
@@ -21,8 +22,16 @@ Item {
 
     readonly property bool hasEngine: typeof translationEngine !== "undefined" && translationEngine !== null
     readonly property bool engineOn: root.hasEngine && translationEngine.enabled
+    // The stream video item (set by DesktopStreamScreen). The frosted
+    // box blurs the video behind it; null keeps the plain white box.
+    property Item videoItem: null
     readonly property bool hasText: root.hasEngine && translationEngine.hasTranslation
-    readonly property string mode: root.hasEngine ? String(translationEngine.overlayMode || "inplace") : "off"
+    // One entry per translated line: {original, translated, x, y, w, h}
+    // with x/y/w/h normalized 0..1 in full-frame coordinates. In-place
+    // mode draws one box per entry, exactly over the English line.
+    readonly property var blocks: root.hasEngine ? translationEngine.translationBlocks : []
+    readonly property string mode: !root.hasEngine ? "off"
+        : String(translationEngine.overlayMode || "inplace")
     // The parent screen (DesktopStreamScreen) exposes `streaming`; fall back
     // to showing on engine state alone when hosted anywhere else.
     readonly property bool parentStreaming: parent && parent.streaming !== undefined
@@ -31,56 +40,17 @@ Item {
 
     visible: root.showing
 
-    // Settings -> engine sync (integration fix): QML is the only side that
-    // can read ShellStore.settings, so this overlay — instantiated on the
-    // stream screen — mirrors "translation.*" into the C++ engine on load
-    // and whenever the settings map changes. Without this, the engine
-    // would keep its defaults (enabled=false) forever no matter what the
-    // Settings page saved. applySetting() replaces the whole settings
-    // object (SettingsState.qml), so settingsChanged fires on every save.
-    function syncEngineFromSettings() {
-        if (!root.hasEngine)
-            return
-        const s = ShellStore.settings || ({})
-        const get = (key, fallback) => {
-            const v = s["translation." + key]
-            return v === undefined || v === null ? fallback : v
-        }
-        translationEngine.enabled = get("enabled", false) === true
-        translationEngine.sourceLanguage = String(get("sourceLanguage", "en"))
-        translationEngine.targetLanguage = String(get("targetLanguage", "vi"))
-        translationEngine.ocrEngine = String(get("ocrEngine", "gemini-vision"))
-        translationEngine.translationProvider = String(get("translationProvider", "google"))
-        translationEngine.overlayMode = String(get("overlayMode", "inplace"))
-        translationEngine.stabilityDelayMs = Number(get("stabilityDelayMs", 400))
-        translationEngine.fontSizePx = Number(get("fontSizePx", 22))
-        translationEngine.showOriginal = get("showOriginal", false) === true
-        translationEngine.cacheEnabled = get("cacheEnabled", true) !== false
-        translationEngine.setDialoguePreset(String(get("dialoguePreset", "wuthering-waves")))
-    }
-
-    Component.onCompleted: root.syncEngineFromSettings()
-
-    Connections {
-        target: ShellStore
-        function onSettingsChanged() { root.syncEngineFromSettings() }
-    }
-
-    // Dialogue area, normalized 0..1, from the engine (default
-    // 0.05, 0.72, 0.90, 0.24). Converted to pixels against this item.
-    readonly property rect dialogueRect: root.hasEngine
-        ? translationEngine.dialogueRect : Qt.rect(0.05, 0.72, 0.90, 0.24)
-    readonly property real boxX: Math.max(0, Math.min(root.dialogueRect.x * root.width,
-        Math.max(0, root.width - root.dialogueRect.width * root.width)))
-    readonly property real boxY: Math.max(0, Math.min(root.dialogueRect.y * root.height,
-        Math.max(0, root.height - root.dialogueRect.height * root.height)))
-    readonly property real boxW: Math.max(0, Math.min(root.dialogueRect.width * root.width, root.width))
-    readonly property real boxH: Math.max(0, Math.min(root.dialogueRect.height * root.height, root.height))
-
     readonly property int baseFontSize: root.hasEngine ? Number(translationEngine.fontSizePx || 22) : 22
     readonly property bool showOriginal: root.hasEngine && translationEngine.showOriginal === true
-    readonly property string translatedText: root.hasEngine ? String(translationEngine.lastTranslatedText || "") : ""
-    readonly property string originalText: root.hasEngine ? String(translationEngine.lastOriginalText || "") : ""
+    // Subtitle mode shows the live blocks joined as lines — never
+    // lastTranslatedText/lastOriginalText: those are the TEST section's
+    // fields, and a "Dịch thử" result must never leak onto the stream.
+    readonly property string blockTranslatedText: root.blocks.map(function(b) {
+        return String(b.translated || "")
+    }).join("\n")
+    readonly property string blockOriginalText: root.blocks.map(function(b) {
+        return String(b.original || "")
+    }).join("\n")
 
     readonly property string timingText: {
         if (!root.hasEngine)
@@ -88,23 +58,63 @@ Item {
         const ocr = Number(translationEngine.lastOcrMs || 0)
         const tr = Number(translationEngine.lastTranslateMs || 0)
         let text = qsTr("OCR %1ms · Dịch %2ms").arg(ocr).arg(tr)
-        if (translationEngine.lastCacheHit === true)
+        if (translationEngine.lastChunkHit === true)
+            text += " · " + qsTr("Chunk hit")
+        else if (translationEngine.lastCacheHit === true)
             text += " · " + qsTr("Cache hit")
         return text
     }
 
-    // One box shape for both modes: semi-transparent dark background, white
-    // wrapped text that shrinks (never overflows the box), optional small
-    // original underneath.
-    component TranslationBox: Rectangle {
+    // One box shape for both modes: WHITE frosted glass (khảm trắng) —
+    // a live blur of the video behind it under a white tint, dark text
+    // in Be Vietnam Pro (bundled, full Vietnamese diacritics). NEVER a
+    // black box: when there is no video item to blur, the box is plain
+    // translucent white instead, so the English line is always covered
+    // by white, never by black.
+    component TranslationBox: Item {
         id: box
         required property string translated
         required property string original
         required property bool showOriginalText
         required property int baseFontSize
-        color: "black"
-        opacity: 0.85
-        radius: DesktopTokens.px(12)
+        readonly property int cornerRadius: DesktopTokens.px(12)
+        // (1) Blurred video behind, clipped to the rounded rect. The
+        // source rect is in video-item coordinates; the overlay and the
+        // video item both fill the same parent, so the coordinates match.
+        Item {
+            id: blurLayer
+            anchors.fill: parent
+            visible: root.videoItem !== null
+            layer.enabled: true
+            layer.effect: MultiEffect {
+                maskEnabled: true
+                maskSource: blurMask
+                blurEnabled: true
+                blurMax: 24
+                blur: 0.55
+            }
+            ShaderEffectSource {
+                anchors.fill: parent
+                sourceItem: root.videoItem
+                sourceRect: Qt.rect(box.x, box.y, box.width, box.height)
+                live: true
+            }
+        }
+        Rectangle {
+            id: blurMask
+            anchors.fill: parent
+            radius: box.cornerRadius
+            color: "white"
+            visible: false
+        }
+        // (2) White tint over the blur (or the whole background when
+        // there is no video to blur).
+        Rectangle {
+            anchors.fill: parent
+            radius: box.cornerRadius
+            color: "white"
+            opacity: root.videoItem !== null ? 0.55 : 0.88
+        }
         Column {
             anchors.fill: parent
             anchors.margins: DesktopTokens.px(12)
@@ -114,9 +124,10 @@ Item {
                 width: parent.width
                 height: parent.height - (originalLabel.visible ? originalLabel.height + parent.spacing : 0)
                 text: box.translated
-                color: "white"
-                font.family: Theme.bodyFont
+                color: "#1a1a2e"
+                font.family: "Be Vietnam Pro"
                 font.pixelSize: box.baseFontSize
+                font.weight: Font.Medium
                 fontSizeMode: Text.Fit
                 minimumPixelSize: 12
                 wrapMode: Text.WordWrap
@@ -128,8 +139,8 @@ Item {
                 visible: box.showOriginalText && box.original !== ""
                 width: parent.width
                 text: box.original
-                color: Qt.rgba(1, 1, 1, 0.65)
-                font.family: Theme.bodyFont
+                color: Qt.rgba(0.10, 0.10, 0.18, 0.65)
+                font.family: "Be Vietnam Pro"
                 font.pixelSize: Math.max(11, Math.round(box.baseFontSize * 0.6))
                 wrapMode: Text.WordWrap
                 elide: Text.ElideRight
@@ -138,19 +149,40 @@ Item {
         }
     }
 
-    // (a) In-place: translated text drawn over the game's dialogue area,
-    // covering the original line.
-    TranslationBox {
-        id: inplaceBox
-        visible: root.showing && root.mode === "inplace"
-        x: root.boxX
-        y: root.boxY
-        width: root.boxW
-        height: root.boxH
-        translated: root.translatedText
-        original: root.originalText
-        showOriginalText: root.showOriginal
-        baseFontSize: root.baseFontSize
+    // (a) In-place: one Vietnamese box per English line, drawn exactly
+    // over the line it translates (the box is padded 8px so the text sits
+    // on the original, and never smaller than the font needs).
+    Repeater {
+        id: blockRepeater
+        model: root.showing && root.mode === "inplace" ? root.blocks : []
+        delegate: TranslationBox {
+            required property var modelData
+            readonly property real blockW: Math.max(DesktopTokens.px(60),
+                Math.min(Number(modelData.w || 0) * root.width + DesktopTokens.px(16), root.width))
+            readonly property real blockH: Math.max(root.baseFontSize + DesktopTokens.px(24),
+                Math.min(Number(modelData.h || 0) * root.height + DesktopTokens.px(16), root.height))
+            x: Math.max(0, Math.min(Number(modelData.x || 0) * root.width - DesktopTokens.px(8),
+                root.width - blockW))
+            y: Math.max(0, Math.min(Number(modelData.y || 0) * root.height - DesktopTokens.px(8),
+                root.height - blockH))
+            width: blockW
+            height: blockH
+            translated: String(modelData.translated || "")
+            original: String(modelData.original || "")
+            showOriginalText: root.showOriginal
+            baseFontSize: root.baseFontSize
+        }
+    }
+
+    // Top edge of the highest in-place box, for the timing pill.
+    readonly property real topBlockY: {
+        let top = root.height
+        for (let i = 0; i < root.blocks.length; i++) {
+            const y = Number(root.blocks[i].y || 0) * root.height
+            if (y < top)
+                top = y
+        }
+        return top
     }
 
     // (b) Subtitle: full-width bar pinned to the bottom of the screen.
@@ -164,33 +196,32 @@ Item {
         anchors.rightMargin: DesktopTokens.px(16)
         anchors.bottomMargin: DesktopTokens.px(16)
         height: DesktopTokens.px(90)
-        translated: root.translatedText
-        original: root.originalText
+        translated: root.blockTranslatedText
+        original: root.blockOriginalText
         showOriginalText: root.showOriginal
         baseFontSize: root.baseFontSize
     }
 
-    // Timing pill, only while a translation is shown. Sits just above the
-    // active box, right-aligned, clamped inside the screen.
+    // Timing pill, only while a translation is shown. In-place it sits
+    // just above the highest translated line; in subtitle mode above the
+    // bar. Right-aligned, clamped inside the screen.
     Rectangle {
         id: statusPill
         visible: root.showing
         width: statusLabel.implicitWidth + DesktopTokens.px(20)
         height: DesktopTokens.px(24)
         radius: height / 2
-        color: "black"
-        opacity: 0.7
-        x: root.mode === "inplace"
-            ? Math.max(0, Math.min(root.boxX + root.boxW - width, root.width - width))
-            : Math.max(0, root.width - width - DesktopTokens.px(16))
+        color: "white"
+        opacity: 0.85
+        x: Math.max(0, root.width - width - DesktopTokens.px(16))
         y: root.mode === "inplace"
-            ? Math.max(0, root.boxY - height - DesktopTokens.px(6))
+            ? Math.max(0, root.topBlockY - height - DesktopTokens.px(6))
             : Math.max(0, root.height - DesktopTokens.px(90 + 16) - height - DesktopTokens.px(6))
         Text {
             id: statusLabel
             anchors.centerIn: parent
             text: root.timingText
-            color: "white"
+            color: "#1a1a2e"
             font.family: Theme.monoFont
             font.pixelSize: DesktopTokens.px(11)
         }

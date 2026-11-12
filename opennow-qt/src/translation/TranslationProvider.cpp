@@ -8,7 +8,7 @@
 #include <QUrlQuery>
 
 namespace {
-constexpr auto GeminiModel = "gemini-2.5-flash-lite";
+constexpr auto GeminiModel = "gemini-3.5-flash-lite";
 
 // Fixed prompt for WuWa story translation. Proper names stay in English,
 // Rover keeps the player's chosen pronouns (the model is told not to
@@ -21,6 +21,17 @@ QString geminiTranslatePrompt(const QString &text)
         "Sentinel). Do not change Rover's pronouns or gender the character. Do not add "
         "explanations, quotes, or any text besides the translation.\n\n")
         + text;
+}
+
+// The same WuWa prompt as a system message for chat-completions APIs:
+// the user message carries only the dialogue text.
+QString customTranslateSystemPrompt()
+{
+    return QStringLiteral(
+        "Translate the following English game dialogue from Wuthering Waves into natural, "
+        "fluent Vietnamese. Keep character and place names in English (e.g. Rover, Jinzhou, "
+        "Sentinel). Do not change Rover's pronouns or gender the character. Do not add "
+        "explanations, quotes, or any text besides the translation.");
 }
 
 bool parseGeminiTranslateText(const QByteArray &body, QString &text, QString &error)
@@ -50,6 +61,17 @@ bool parseGeminiTranslateText(const QByteArray &body, QString &text, QString &er
     return true;
 }
 } // namespace
+
+TranslateResult TranslationProvider::translateStreaming(const QString &englishText,
+                                                       const QString &sourceLanguage,
+                                                       const QString &targetLanguage,
+                                                       const TranslateChunkCallback &onChunk)
+{
+    TranslateResult result = translate(englishText, sourceLanguage, targetLanguage);
+    if (result.ok && onChunk)
+        onChunk(result.text);
+    return result;
+}
 
 TranslateResult GoogleTranslateProvider::translate(const QString &englishText,
                                                    const QString &sourceLanguage,
@@ -131,12 +153,95 @@ TranslateResult GeminiTranslateProvider::translate(const QString &englishText,
     return TranslateResult{true, text, {}};
 }
 
-std::unique_ptr<TranslationProvider> createTranslationProvider(const QString &id,
-                                                               const QString &geminiApiKey)
+std::unique_ptr<TranslationProvider> createTranslationProvider(
+    const QString &id, const QString &geminiApiKey, const CustomApiConfig &customApi)
 {
     if (id == QStringLiteral("google"))
         return std::make_unique<GoogleTranslateProvider>();
     if (id == QStringLiteral("gemini"))
         return std::make_unique<GeminiTranslateProvider>(geminiApiKey);
+    if (id == QStringLiteral("custom"))
+        return std::make_unique<CustomApiTranslateProvider>(customApi);
     return nullptr;
+}
+
+CustomApiTranslateProvider::CustomApiTranslateProvider(const CustomApiConfig &config)
+    : m_config(config)
+{
+}
+
+void CustomApiTranslateProvider::setConfig(const CustomApiConfig &config)
+{
+    m_config = config;
+}
+
+TranslateResult CustomApiTranslateProvider::translate(const QString &englishText,
+                                                      const QString &sourceLanguage,
+                                                      const QString &targetLanguage)
+{
+    Q_UNUSED(sourceLanguage)
+    Q_UNUSED(targetLanguage)
+    if (!m_config.isConfigured())
+        return TranslateResult{false, {},
+                               QStringLiteral("Custom API not configured: set base URL, API key and model")};
+    if (englishText.trimmed().isEmpty())
+        return TranslateResult{false, {}, QStringLiteral("Nothing to translate")};
+
+    const QByteArray payload = buildChatCompletionPayload(
+        m_config.model, customTranslateSystemPrompt(), englishText, {}, false);
+    // Key travels in the Authorization header, never in the URL, and is
+    // never logged.
+    const TranslationHttpResult result = TranslationHttp::postJson(
+        customApiChatUrl(m_config.baseUrl), payload,
+        {{QByteArrayLiteral("Authorization"),
+          QByteArrayLiteral("Bearer ") + m_config.apiKey.toUtf8()}});
+    if (!result.ok())
+        return TranslateResult{false, {}, result.error};
+
+    QString text;
+    QString error;
+    if (!parseChatCompletionText(result.body, text, error))
+        return TranslateResult{false, {}, error};
+    return TranslateResult{true, text, {}};
+}
+
+TranslateResult CustomApiTranslateProvider::translateStreaming(
+    const QString &englishText, const QString &sourceLanguage, const QString &targetLanguage,
+    const TranslateChunkCallback &onChunk)
+{
+    Q_UNUSED(sourceLanguage)
+    Q_UNUSED(targetLanguage)
+    if (!m_config.isConfigured())
+        return TranslateResult{false, {},
+                               QStringLiteral("Custom API not configured: set base URL, API key and model")};
+    if (englishText.trimmed().isEmpty())
+        return TranslateResult{false, {}, QStringLiteral("Nothing to translate")};
+
+    const QByteArray payload = buildChatCompletionPayload(
+        m_config.model, customTranslateSystemPrompt(), englishText, {}, true);
+    // The SSE body is accumulated here; parseSseStreamText re-parses the
+    // whole buffer after every chunk, so a chunk split mid-line still
+    // yields the right text, and only growth is reported to the caller.
+    QByteArray sseBuffer;
+    QString emitted;
+    const TranslationHttpResult result = TranslationHttp::postStream(
+        customApiChatUrl(m_config.baseUrl), payload,
+        {{QByteArrayLiteral("Authorization"),
+          QByteArrayLiteral("Bearer ") + m_config.apiKey.toUtf8()}},
+        [&](const QByteArray &chunk) {
+            sseBuffer.append(chunk);
+            const QString parsed = parseSseStreamText(sseBuffer);
+            if (parsed.size() > emitted.size() && parsed.startsWith(emitted)) {
+                emitted = parsed;
+                if (onChunk)
+                    onChunk(emitted);
+            }
+        });
+    if (!result.ok())
+        return TranslateResult{false, {}, result.error};
+
+    const QString text = parseSseStreamText(sseBuffer).trimmed();
+    if (text.isEmpty())
+        return TranslateResult{false, {}, QStringLiteral("API returned empty text")};
+    return TranslateResult{true, text, {}};
 }

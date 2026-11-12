@@ -9,7 +9,7 @@ permissions:
 jobs:
   contracts:
     name: Workflow, packaging contracts, and localization
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

@@ -258,6 +258,15 @@ static int runApplicationSession(int argc, char *argv[], QString &restartExecuta
     QObject::connect(&nativeStreamRuntime, &NativeStreamRuntime::screenshotReady,
                      &translationEngine, &TranslationEngine::onStreamFrame,
                      Qt::QueuedConnection);
+    // Frame pump: screenshotReady only fires for an explicit screenshot
+    // request, so the engine asks for one frame per second while it is
+    // enabled. Without this the engine receives no frames during gameplay
+    // and live OCR never runs. requestScreenshot() is a no-op while no
+    // stream is presenting and while one is already pending, and
+    // saveStreamScreenshot only saves when the user took a screenshot, so
+    // the pump can neither pile up nor write files.
+    QObject::connect(&translationEngine, &TranslationEngine::frameRequested,
+                     &nativeStreamRuntime, &NativeStreamRuntime::requestScreenshot);
     QObject::connect(&nativeStreamRuntime, &NativeStreamRuntime::controllerRumbleRequested,
                      &controllerInput, &ControllerInput::playRumble);
     QObject::connect(&nativeStreamRuntime, &NativeStreamRuntime::controllerRumbleStopped,

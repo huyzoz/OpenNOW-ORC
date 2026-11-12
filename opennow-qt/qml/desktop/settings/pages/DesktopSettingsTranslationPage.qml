@@ -4,11 +4,14 @@ import OpenNOW
 
 // Translation settings: screen OCR (EN source) -> Vietnamese overlay.
 //
-// Persistence: every persisted key lives in ShellStore.settings under
-// "translation.<key>" and is written through settingsScreen.setSetting — the
-// same path every other page uses. The C++ translationEngine mirrors those
-// settings into its live properties. The Gemini API key is the exception: it
-// is NEVER written to ShellStore.settings; it goes only to
+// Persistence: translation settings live in the C++ translationEngine,
+// which persists them in QSettings under "translation/<key>". They must
+// NEVER go through ShellStore.settings: the Rust core rejects unknown
+// setting keys ("Unknown setting: translation.enabled"), so a write
+// through the core is rolled back about a second later and the toggle
+// flips back off. Every control on this page binds straight to the
+// engine's properties. The Gemini API key is the exception: it is NEVER
+// written to ShellStore.settings; it goes only to
 // translationEngine.setGeminiApiKey() and this page only ever shows
 // "Đã lưu key" / "Chưa có key", never the key value.
 //
@@ -24,56 +27,45 @@ Column {
 
     width: page.availableWidth; spacing: DesktopTokens.px(12)
 
-    function t(key, fallback) { return page.settingsScreen.valueSetting("translation." + key, fallback) }
-    function tb(key, fallback) { return page.settingsScreen.boolSetting("translation." + key, fallback) }
-    // Push one saved value into the live engine (no settings write).
-    function pushToEngine(key, value) {
-        if (!page.hasEngine)
-            return
-        if (key === "enabled") translationEngine.enabled = value === true
-        else if (key === "sourceLanguage") translationEngine.sourceLanguage = String(value)
-        else if (key === "targetLanguage") translationEngine.targetLanguage = String(value)
-        else if (key === "ocrEngine") translationEngine.ocrEngine = String(value)
-        else if (key === "translationProvider") translationEngine.translationProvider = String(value)
-        else if (key === "overlayMode") translationEngine.overlayMode = String(value)
-        else if (key === "stabilityDelayMs") translationEngine.stabilityDelayMs = Number(value)
-        else if (key === "fontSizePx") translationEngine.fontSizePx = Number(value)
-        else if (key === "showOriginal") translationEngine.showOriginal = value === true
-        else if (key === "cacheEnabled") translationEngine.cacheEnabled = value !== false
-        else if (key === "dialoguePreset") translationEngine.setDialoguePreset(String(value))
-    }
-    function setT(key, value) {
-        page.settingsScreen.setSetting("translation." + key, value)
-        // Push the change to the live engine immediately (same reason as
-        // TranslationOverlay.syncEngineFromSettings): the engine cannot
-        // read ShellStore.settings itself, so a save alone would leave it
-        // on stale values until the stream screen reloads.
-        page.pushToEngine(key, value)
-    }
+    // The engine is a C++ context property registered by ApplicationStartup.
+    // (Was missing entirely in v1: every page.hasEngine read was undefined,
+    // so no setting ever reached the engine and the Test/Save/Clear buttons
+    // stayed disabled.)
+    readonly property bool hasEngine: typeof translationEngine !== "undefined" && translationEngine !== null
+    property bool keySaved: false
+    property bool customKeySaved: false
 
     Component.onCompleted: {
         if (page.hasEngine) {
             page.keySaved = translationEngine.hasGeminiApiKey()
-            // Sync saved settings into the engine now (push only — no
-            // settings writes), so the Test section below uses the saved
-            // engine/provider even before any stream.
-            page.pushToEngine("enabled", page.tb("enabled", false))
-            page.pushToEngine("sourceLanguage", String(page.t("sourceLanguage", "en")))
-            page.pushToEngine("targetLanguage", String(page.t("targetLanguage", "vi")))
-            page.pushToEngine("ocrEngine", String(page.t("ocrEngine", "gemini-vision")))
-            page.pushToEngine("translationProvider", String(page.t("translationProvider", "google")))
-            page.pushToEngine("overlayMode", String(page.t("overlayMode", "inplace")))
-            page.pushToEngine("stabilityDelayMs", Number(page.t("stabilityDelayMs", 400)))
-            page.pushToEngine("fontSizePx", Number(page.t("fontSizePx", 22)))
-            page.pushToEngine("showOriginal", page.tb("showOriginal", false))
-            page.pushToEngine("cacheEnabled", page.tb("cacheEnabled", true))
-            page.pushToEngine("dialoguePreset", String(page.t("dialoguePreset", "wuthering-waves")))
+            page.customKeySaved = translationEngine.hasCustomApiKey()
         }
     }
 
-    readonly property string ocrEngine: String(page.t("ocrEngine", "gemini-vision"))
-    readonly property string provider: String(page.t("translationProvider", "google"))
-    readonly property string overlayMode: String(page.t("overlayMode", "inplace"))
+    readonly property string ocrEngine: page.hasEngine ? String(translationEngine.ocrEngine || "gemini-vision") : "gemini-vision"
+    readonly property string provider: page.hasEngine ? String(translationEngine.translationProvider || "google") : "google"
+    readonly property string overlayMode: page.hasEngine ? String(translationEngine.overlayMode || "inplace") : "inplace"
+    // The custom API is usable when base + key + model are all set.
+    readonly property bool customConfigured: page.hasEngine
+        && String(translationEngine.customApiBase || "") !== ""
+        && page.customKeySaved
+        && String(translationEngine.customApiModel || "") !== ""
+    // True once the selected game's chunk files are on disk (downloaded),
+    // regardless of whether chunk mode is on. Drives the "Đã tải" button
+    // state and the toggle hint below.
+    readonly property bool chunkDownloaded: page.hasEngine && translationEngine.chunkDownloaded === true
+    // Model dropdown items: the live list from {base}/models when
+    // fetched, otherwise just the currently saved model (or a hint).
+    readonly property var customModelItems: {
+        const models = page.hasEngine ? (translationEngine.customApiModels || []) : []
+        if (models.length === 0) {
+            const current = page.hasEngine ? String(translationEngine.customApiModel || "") : ""
+            return current !== ""
+                ? [{label: current, value: current}]
+                : [{label: qsTr("Chưa lấy danh sách"), value: ""}]
+        }
+        return models.map(m => ({label: String(m), value: String(m)}))
+    }
 
     // (a) Bật / Tắt
     DesktopSettingsPanel {
@@ -81,13 +73,16 @@ Column {
         DesktopSettingsSection { text: qsTr("TRANSLATION") }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Dịch màn hình")
-            description: qsTr("Nhận diện chữ tiếng Anh trên màn hình stream rồi dịch sang tiếng Việt. Tắt = đúng bản gốc 100%.")
+            description: (page.hasEngine && !translationEngine.visionKeyConfigured)
+                ? qsTr("Bắt buộc: dán key Gemini hoặc key Custom API ở dưới để bật.")
+                : qsTr("Nhận diện chữ tiếng Anh trên màn hình stream rồi dịch sang tiếng Việt. Tắt = đúng bản gốc 100%.")
             showDivider: false
             DesktopSettingsToggle {
                 objectName: "translationEnabledToggle"
-                checked: page.tb("enabled", false)
+                checked: page.hasEngine && translationEngine.enabled
+                enabled: page.hasEngine && translationEngine.visionKeyConfigured
                 Accessible.name: qsTr("Dịch màn hình")
-                onValueChangedByUser: value => page.setT("enabled", value)
+                onValueChangedByUser: value => { if (page.hasEngine) translationEngine.enabled = value }
             }
         }
         DesktopSettingsRow {
@@ -113,8 +108,8 @@ Column {
                 {label: qsTr("Japanese"), value: "ja"},
                 {label: qsTr("Chinese"), value: "zh"}
             ]
-            value: String(page.t("sourceLanguage", "en"))
-            onSelected: value => page.setT("sourceLanguage", value)
+            value: page.hasEngine ? String(translationEngine.sourceLanguage || "en") : "en"
+            onSelected: value => { if (page.hasEngine) translationEngine.sourceLanguage = value }
         }
         DesktopSettingsChoice {
             objectName: "translationTargetLanguage"
@@ -127,8 +122,8 @@ Column {
                 {label: qsTr("Français"), value: "fr"},
                 {label: qsTr("Deutsch"), value: "de"}
             ]
-            value: String(page.t("targetLanguage", "vi"))
-            onSelected: value => page.setT("targetLanguage", value)
+            value: page.hasEngine ? String(translationEngine.targetLanguage || "vi") : "vi"
+            onSelected: value => { if (page.hasEngine) translationEngine.targetLanguage = value }
         }
     }
 
@@ -141,30 +136,30 @@ Column {
             width: parent.width; glyph: "monitor"; title: qsTr("OCR engine")
             description: page.ocrEngine === "rapidocr" || page.ocrEngine === "windows-ocr"
                 ? qsTr("Chưa khả dụng trong bản này — sẽ có ở bản sau.")
+                : page.ocrEngine === "custom-vision" && !page.customConfigured
+                ? qsTr("Cần base + key + model — điền ở mục API tùy chỉnh bên dưới.")
                 : qsTr("Engine nhận diện chữ trên màn hình stream.")
             items: [
                 {label: qsTr("Gemini Vision"), value: "gemini-vision", detail: qsTr("Mặc định · cần key Gemini")},
                 {label: qsTr("Tesseract"), value: "tesseract", detail: qsTr("Offline · chạy trên máy")},
+                {label: qsTr("API tùy chỉnh (Vision)"), value: "custom-vision", detail: qsTr("Cần model có vision")},
                 {label: qsTr("RapidOCR"), value: "rapidocr", detail: qsTr("Chưa khả dụng trong bản này")},
                 {label: qsTr("Windows OCR"), value: "windows-ocr", detail: qsTr("Chưa khả dụng trong bản này")}
             ]
             value: page.ocrEngine
-            onSelected: value => page.setT("ocrEngine", value)
+            onSelected: value => { if (page.hasEngine) translationEngine.ocrEngine = value }
         }
         DesktopSettingsChoice {
             objectName: "translationDialoguePreset"
             width: parent.width; glyph: "image"; title: qsTr("Vùng thoại")
-            description: qsTr("Vùng màn hình lấy chữ để dịch. Vùng thoại tuỳ chỉnh sẽ có ở bản sau; hiện chỉ chọn preset.")
+            description: qsTr("Vùng màn hình lấy chữ để dịch. Toàn màn hình dịch mọi chữ: thoại, nhiệm vụ, chat, menu.")
             items: [
-                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("Vùng thoại dưới màn hình · mặc định")},
+                {label: qsTr("Toàn màn hình"), value: "full-screen", detail: qsTr("Mặc định · dịch mọi chữ trên màn hình")},
+                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("Chỉ vùng thoại dưới màn hình")},
                 {label: qsTr("Generic"), value: "generic", detail: qsTr("Vùng thoại chung")}
             ]
-            value: String(page.t("dialoguePreset", "wuthering-waves"))
-            onSelected: value => {
-                page.setT("dialoguePreset", value)
-                if (page.hasEngine)
-                    translationEngine.setDialoguePreset(value)
-            }
+            value: page.hasEngine ? String(translationEngine.dialoguePreset || "full-screen") : "full-screen"
+            onSelected: value => { if (page.hasEngine) translationEngine.setDialoguePreset(value) }
         }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "speed"; title: qsTr("Độ ổn định")
@@ -174,8 +169,8 @@ Column {
                 objectName: "translationStabilitySlider"
                 accessibleName: qsTr("Độ ổn định")
                 from: 200; to: 1000; stepSize: 10; suffix: " ms"
-                value: Number(page.t("stabilityDelayMs", 400))
-                onCommitted: value => page.setT("stabilityDelayMs", Math.round(value))
+                value: page.hasEngine ? Number(translationEngine.stabilityDelayMs || 400) : 400
+                onCommitted: value => { if (page.hasEngine) translationEngine.stabilityDelayMs = Math.round(value) }
             }
         }
     }
@@ -189,13 +184,16 @@ Column {
             width: parent.width; glyph: "globe"; title: qsTr("Dịch bằng")
             description: page.provider === "gemini" && !page.keySaved
                 ? qsTr("Cần key Gemini — chưa có key. Dán key ở dưới.")
+                : page.provider === "custom" && !page.customConfigured
+                ? qsTr("Cần base + key + model — điền ở mục API tùy chỉnh bên dưới.")
                 : qsTr("Dịch vụ dịch bản OCR sang tiếng Việt.")
             items: [
                 {label: qsTr("Google Translate"), value: "google", detail: qsTr("Miễn phí · mặc định")},
-                {label: qsTr("Gemini"), value: "gemini", detail: qsTr("Cần key Gemini")}
+                {label: qsTr("Gemini"), value: "gemini", detail: qsTr("Cần key Gemini")},
+                {label: qsTr("API tùy chỉnh"), value: "custom", detail: qsTr("Base + key riêng · stream")}
             ]
             value: page.provider
-            onSelected: value => page.setT("translationProvider", value)
+            onSelected: value => { if (page.hasEngine) translationEngine.translationProvider = value }
         }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Gemini API key")
@@ -225,6 +223,160 @@ Column {
         }
     }
 
+    // (d2) API tùy chỉnh — bất kỳ base chuẩn OpenAI nào (OpenAI,
+    // OpenRouter, Groq, DeepSeek, Together, server tự host…). Người dùng
+    // tự dán base + key, bấm lấy danh sách model (ping {base}/models
+    // bằng key đó), rồi chọn model. Dịch chạy stream: chữ hiện dần
+    // trong lúc model còn đang sinh, thay vì đợi cả câu trả xong.
+    DesktopSettingsPanel {
+        width: parent.width; paperStyle: true
+        DesktopSettingsSection { text: qsTr("CUSTOM API") }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Base URL")
+            description: qsTr("Base URL của API chuẩn OpenAI — vd https://api.openai.com/v1")
+            showDivider: false
+            DesktopSettingsField {
+                id: customBaseField
+                objectName: "translationCustomApiBaseField"
+                text: page.hasEngine ? String(translationEngine.customApiBase || "") : ""
+                placeholderText: qsTr("Dán base URL…")
+                Accessible.name: qsTr("Base URL")
+                onEditingFinished: {
+                    if (page.hasEngine) translationEngine.customApiBase = text
+                }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("API key")
+            description: (page.customKeySaved ? qsTr("Đã lưu key.") : qsTr("Chưa có key.")) + " "
+                + qsTr("Key chỉ lưu trên máy này, không gửi đi đâu khác ngoài base trên.")
+            showDivider: false
+            DesktopSettingsField {
+                id: customKeyField
+                objectName: "translationCustomApiKeyField"
+                echoMode: TextInput.Password
+                placeholderText: qsTr("Dán key API…")
+                Accessible.name: qsTr("API key")
+            }
+            DesktopSettingsButton {
+                objectName: "translationCustomApiKeySaveButton"
+                compact: true
+                enabled: page.hasEngine && customKeyField.text !== ""
+                text: qsTr("Lưu key")
+                onClicked: {
+                    if (!page.hasEngine)
+                        return
+                    translationEngine.setCustomApiKey(customKeyField.text)
+                    customKeyField.text = ""
+                    page.customKeySaved = translationEngine.hasCustomApiKey()
+                }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "check"; title: qsTr("Lấy danh sách model")
+            description: qsTr("Danh sách model lấy từ /models của base trên, bằng key của bạn. Dùng được với mọi base chuẩn OpenAI (OpenAI, OpenRouter, Groq, DeepSeek…).")
+            showDivider: false
+            DesktopSettingsButton {
+                objectName: "translationCustomApiFetchModelsButton"
+                compact: true
+                enabled: page.hasEngine && customBaseField.text !== "" && page.customKeySaved
+                text: qsTr("Lấy danh sách model")
+                onClicked: {
+                    if (!page.hasEngine)
+                        return
+                    // Commit the base first: it is only saved to the
+                    // engine on editingFinished, and fetch reads it.
+                    translationEngine.customApiBase = customBaseField.text
+                    translationEngine.fetchCustomApiModels()
+                }
+            }
+        }
+        DesktopSettingsChoice {
+            objectName: "translationCustomApiModel"
+            width: parent.width; glyph: "monitor"; title: qsTr("Model")
+            description: qsTr("Model đang dùng để dịch (và OCR nếu chọn Vision).")
+            showDivider: false
+            items: page.customModelItems
+            value: page.hasEngine ? String(translationEngine.customApiModel || "") : ""
+            onSelected: value => { if (page.hasEngine && value !== "") translationEngine.customApiModel = value }
+        }
+    }
+
+    // (d3) Dịch Chunk — pre-translated database (v4). When ON, OCR'd
+    // lines are looked up in the downloaded chunk database first (no AI
+    // call, no tokens); misses fall back to the provider above. The
+    // detail card shows the selected game's chunk info; the game list is
+    // built for future games.
+    DesktopSettingsPanel {
+        width: parent.width; paperStyle: true
+        DesktopSettingsSection { text: qsTr("CHUNK") }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "controller"; title: qsTr("Dịch Chunk")
+            description: page.chunkDownloaded
+                ? qsTr("Đã tải sẵn cơ sở dữ liệu — bật để dùng, không gọi AI, không tốn token.")
+                : qsTr("Dịch bằng cơ sở dữ liệu Việt hoá sẵn — không gọi AI, không tốn token, hiện ngay. Tắt = dịch bằng provider đang chọn.")
+            showDivider: false
+            DesktopSettingsToggle {
+                objectName: "translationChunkToggle"
+                checked: page.hasEngine && translationEngine.chunkEnabled
+                Accessible.name: qsTr("Dịch Chunk")
+                onValueChangedByUser: value => { if (page.hasEngine) translationEngine.chunkEnabled = value }
+            }
+        }
+        DesktopSettingsChoice {
+            objectName: "translationChunkGame"
+            width: parent.width; glyph: "controller"; title: qsTr("Game")
+            description: qsTr("Game dùng chunk Việt hoá sẵn. Hiện chỉ có Wuthering Waves; game khác sẽ thêm sau.")
+            items: [
+                {label: qsTr("Wuthering Waves"), value: "wuthering-waves", detail: qsTr("3.8 · Lilies in a Dying Dream")}
+            ]
+            value: page.hasEngine ? String(translationEngine.chunkGame || "wuthering-waves") : "wuthering-waves"
+            onSelected: value => { if (page.hasEngine) translationEngine.chunkGame = value }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Phiên bản chunk")
+            description: page.hasEngine ? String(translationEngine.chunkGameVersion || "") : ""
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Đã dịch")
+            description: page.hasEngine && String(translationEngine.chunkTranslatedText || "") !== ""
+                ? String(translationEngine.chunkTranslatedText)
+                : qsTr("Chưa tải — bấm Tải chunk để xem")
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Từ vựng")
+            description: page.hasEngine ? String(translationEngine.chunkGameWordsText || "") : ""
+            showDivider: false
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("Trạng thái")
+            description: page.hasEngine ? String(translationEngine.chunkStatus || qsTr("Chưa tải chunk")) : qsTr("Chưa tải chunk")
+            showDivider: false
+            DesktopSettingsButton {
+                objectName: "translationChunkDownloadButton"
+                compact: true
+                enabled: page.hasEngine && !page.chunkDownloaded
+                text: page.chunkDownloaded ? qsTr("Đã tải") : qsTr("Tải chunk")
+                onClicked: { if (page.hasEngine) translationEngine.downloadChunks() }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Kho chunk")
+            description: qsTr("Mã nguồn dữ liệu chunk trên GitHub.")
+            showDivider: false
+            Text {
+                text: "<a href=\"" + (page.hasEngine ? String(translationEngine.chunkRepoUrl || "") : "") + "\">huyzoz/wuwa-vi-chunks</a>"
+                color: Theme.label
+                linkColor: Theme.focus
+                font.family: Theme.bodyFont
+                font.pixelSize: DesktopTokens.bodySize
+                onLinkActivated: link => Qt.openUrlExternally(link)
+            }
+        }
+    }
+
     // (e) Hiển thị
     DesktopSettingsPanel {
         width: parent.width; paperStyle: true
@@ -243,7 +395,7 @@ Column {
                 {label: qsTr("Tắt hiển thị"), value: "off"}
             ]
             value: page.overlayMode
-            onSelected: value => page.setT("overlayMode", value)
+            onSelected: value => { if (page.hasEngine) translationEngine.overlayMode = value }
         }
         DesktopSettingsRow {
             width: parent.width; paperStyle: true; glyph: "sun"; title: qsTr("Cỡ chữ")
@@ -252,8 +404,8 @@ Column {
                 objectName: "translationFontSizeSlider"
                 accessibleName: qsTr("Cỡ chữ")
                 from: 16; to: 32; stepSize: 1; suffix: " px"
-                value: Number(page.t("fontSizePx", 22))
-                onCommitted: value => page.setT("fontSizePx", Math.round(value))
+                value: page.hasEngine ? Number(translationEngine.fontSizePx || 22) : 22
+                onCommitted: value => { if (page.hasEngine) translationEngine.fontSizePx = Math.round(value) }
             }
         }
         DesktopSettingsRow {
@@ -261,9 +413,9 @@ Column {
             description: qsTr("Hiện chữ gốc nhỏ bên dưới bản dịch.")
             DesktopSettingsToggle {
                 objectName: "translationShowOriginalToggle"
-                checked: page.tb("showOriginal", false)
+                checked: page.hasEngine && translationEngine.showOriginal
                 Accessible.name: qsTr("Hiện cả chữ gốc")
-                onValueChangedByUser: value => page.setT("showOriginal", value)
+                onValueChangedByUser: value => { if (page.hasEngine) translationEngine.showOriginal = value }
             }
         }
         DesktopSettingsRow {
@@ -271,9 +423,9 @@ Column {
             description: qsTr("Câu đã dịch rồi thì dùng lại ngay, không gọi API nữa.")
             DesktopSettingsToggle {
                 objectName: "translationCacheToggle"
-                checked: page.tb("cacheEnabled", true)
+                checked: page.hasEngine && translationEngine.cacheEnabled
                 Accessible.name: qsTr("Cache bản dịch")
-                onValueChangedByUser: value => page.setT("cacheEnabled", value)
+                onValueChangedByUser: value => { if (page.hasEngine) translationEngine.cacheEnabled = value }
             }
         }
         DesktopSettingsRow {

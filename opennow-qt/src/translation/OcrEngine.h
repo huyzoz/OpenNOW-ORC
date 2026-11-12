@@ -6,8 +6,11 @@
 // one, -1 when it does not (e.g. Tesseract).
 //
 // Implementations:
-//  - GeminiVisionOcrEngine: REAL, Gemini 2.5 Flash-Lite vision, Qt Network.
+//  - GeminiVisionOcrEngine: REAL, Gemini 3.5 Flash-Lite vision, Qt Network.
 //    API key is passed in (never logged, never stored in code).
+//  - CustomVisionOcrEngine: REAL, any OpenAI-compatible vision model the
+//    user configures (base + key + model). Same blocks-JSON prompt as
+//    Gemini Vision; only usable with a model that accepts images.
 //  - TesseractOcrEngine: REAL, optional `tesseract` binary via QProcess.
 //    Gracefully unavailable when the binary is missing.
 //  - RapidOcrEngine: STUB (NotAvailable). ONNX Runtime is not vendored in
@@ -19,16 +22,36 @@
 //    classic Win32 executable, so the API cannot be activated.
 #pragma once
 
+#include <QList>
+#include <QMetaType>
+#include <QRectF>
 #include <QString>
 #include <memory>
 
+#include "translation/CustomApi.h"
+
 class QImage;
+
+// One line of recognized text and where it sits in the recognized image.
+// rect is normalized 0..1 within the image (x, y, w, h). The overlay draws
+// one translated box per block, exactly over the English line — that is
+// what "translate over the original text" means; a single box over the
+// whole dialogue area is not it.
+struct OcrBlock
+{
+    QString text;
+    QRectF rect;
+};
+Q_DECLARE_METATYPE(OcrBlock)
 
 struct OcrResult
 {
     enum class Status { Ok, NotAvailable, Failed };
     Status status = Status::Failed;
     QString text;       // English dialogue text, "" when none found
+    // One block per line, in reading order. text is the blocks joined
+    // with "\n" (kept for callers that only need the flat text).
+    QList<OcrBlock> blocks;
     double confidence = -1.0; // 0..1, or -1 when the engine reports none
     QString error;      // human-readable, safe to show; never contains a key
 };
@@ -58,6 +81,20 @@ private:
     QString m_apiKey; // never logged, never written to disk by this class
 };
 
+class CustomVisionOcrEngine final : public OcrEngine
+{
+public:
+    explicit CustomVisionOcrEngine(const CustomApiConfig &config = {});
+    void setConfig(const CustomApiConfig &config); // key held in memory only
+    QString id() const override { return QStringLiteral("custom-vision"); }
+    QString displayName() const override { return QStringLiteral("Custom API (Vision)"); }
+    bool available() const override { return m_config.isConfigured(); }
+    OcrResult recognize(const QImage &image) override;
+
+private:
+    CustomApiConfig m_config; // base + key + model; key never logged
+};
+
 class TesseractOcrEngine final : public OcrEngine
 {
 public:
@@ -85,6 +122,8 @@ public:
     OcrResult recognize(const QImage &) override;
 };
 
-// Factory. `geminiApiKey` is forwarded only to GeminiVisionOcrEngine.
+// Factory. `geminiApiKey` is forwarded only to GeminiVisionOcrEngine;
+// `customApi` only to CustomVisionOcrEngine.
 // Returns nullptr for an unknown id.
-std::unique_ptr<OcrEngine> createOcrEngine(const QString &id, const QString &geminiApiKey = {});
+std::unique_ptr<OcrEngine> createOcrEngine(const QString &id, const QString &geminiApiKey = {},
+                                           const CustomApiConfig &customApi = {});

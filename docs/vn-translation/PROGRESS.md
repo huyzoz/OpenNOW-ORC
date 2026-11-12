@@ -346,3 +346,406 @@ running; R4–R8 are follow-ups.**
   file touched outside the original 3 shims, and it is documented in
   `UPDATER.md` §4. Full repoint to `duyzoz/OpenNOW-ORC` + a VN keypair is
   still a separate approved step touching `native/`.
+
+## 2026-11-11 — Live-test fix: toggle won't stay on + full-screen region (run #14)
+
+Ethan live-tested the run #13 build (video 17:34): Settings > Translation
+renders correctly in Vietnamese, but the "Dịch màn hình" toggle flips ON
+then back OFF after ~1s, and the TEST section says "Translation engine
+chưa sẵn sàng". Root causes, both from the overnight build:
+
+1. `DesktopSettingsTranslationPage.qml` used `page.hasEngine` /
+   `page.keySaved` but never declared them (undefined = falsy), so
+   `pushToEngine()` always returned early — no setting ever reached the
+   engine, and Test / Save-key / Clear-cache stayed disabled.
+2. Translation settings were written through `ShellStore.setSetting` to
+   the Rust core, whose `SettingsStore::set` rejects unknown keys
+   (`settings.rs:206` — "Unknown setting: translation.enabled" ->
+   `invalid_setting`). The optimistic apply showed the toggle ON for ~1s,
+   then `finishSettingWrite` -> `reconcileSetting` restored the old value.
+
+Fix (no `native/` changes — that area stays untouched per Ethan's order):
+- The C++ engine is now the store of record: every setting is loaded
+  from / saved to QSettings under `translation/<key>` (same store the
+  Gemini key already used). The QML page binds straight to the engine's
+  properties; the overlay's `syncEngineFromSettings()` (which would have
+  overwritten engine values with ShellStore fallbacks) is deleted.
+- New preset "Toàn màn hình" (`full-screen`, rect 0,0,1,1): OCR reads the
+  whole frame — dialogue, menus, labels — not just the dialogue box.
+  Gemini OCR prompt widened from dialogue-only to all English text.
+  Full-screen frames never stabilize (HUD/animation pixels change every
+  frame), so the stability-hash gate is replaced by a 2s throttle
+  (`FullScreenIntervalMs`) in that mode. An in-place box over the whole
+  frame would hide the game, so selecting full-screen auto-switches the
+  display mode to subtitle (engine-side) and the overlay forces subtitle
+  for full-screen rects (defense in depth).
+- Unit test `dialoguePresetRects` (static `dialogueRectForPreset` helper)
+  + Python mirror checks; `npm run locales:check` exit 0 (2326 texts,
+  2 new qmlSource entries: `toan_man_hinh`, `toan_bo_man_hinh`).
+
+Still NOT fixed by this change — Ethan must do one of these for OCR to
+run at all: paste a free Gemini API key (Google AI Studio) into the
+Gemini API key field, or install Tesseract. Gemini Vision needs a key;
+RapidOCR and Windows OCR are still stubs. The "Dịch thử" TEST button
+works without a key (Google Translate, free). Live verification of the
+toggle + full-screen translation is still Ethan's eyes.
+
+## v2 — per-line in-place overlay + frame pump (2026-11-11 evening, local commit TBD)
+
+Ethan's live test of run #20 (video, 61s of WuWa gameplay): the translation
+never overwrote any English text. The ONLY thing on screen the whole video
+was one black subtitle bar at the bottom showing the same sentence —
+"Rover đi vào thành phố, tìm kiếm câu trả lời." — the default "Dịch thử"
+test input. He is right: v1 did not do what he asked for.
+
+Root causes found by reading the code (not guessing):
+1. NO FRAMES: `screenshotReady` fires only for an explicit screenshot
+   request (`requestScreenshot()` → fulfilled on the next presented frame
+   by `NativeStreamRenderCallback::prepareFrame`). During normal gameplay
+   nothing ever requests one, so `TranslationEngine::onStreamFrame` is
+   never called and live OCR literally never runs.
+2. TEST LEAK: `requestTestTranslation` went through `emitTranslation`,
+   which sets `hasTranslation` + emits `translationReady` — so the TEST
+   result stuck on the live overlay as a permanent subtitle bar. With no
+   jobs ever running, no error ever cleared it after 2s, so it stayed for
+   the whole video.
+3. DESIGN GAP: even with frames, v1 drew ONE box over the dialogue area
+   (or a subtitle bar for full-screen) — never Vietnamese text positioned
+   over each English line. That is not "dịch đè lên chữ tiếng Anh cũ".
+
+Fix (this change):
+- Frame pump: `TranslationEngine` runs a 1s `QTimer` while enabled and
+  emits `frameRequested`; `ApplicationStartup` connects it to
+  `NativeStreamRuntime::requestScreenshot()`. Verified safe:
+  `requestScreenshot()` is a no-op while no stream is presenting and
+  while one is already pending, and `AppController::saveStreamScreenshot`
+  only saves when the user took a screenshot (`m_screenshotPending`) —
+  the pump can neither pile up nor write files.
+- Per-line blocks: OCR now returns `OcrBlock{text, rect}` per line
+  (rect normalized 0..1 within the crop). Gemini prompt asks for JSON
+  `{"blocks": [{text, x, y, w, h}], "confidence"}` (old `{"text"}` shape
+  still accepted as one whole-image block). Tesseract runs `tsv` first
+  and groups level-5 word rows into lines by (block, par, line), with a
+  plain-text fallback as one whole-image block.
+- Worker translates the blocks joined with "\n" in ONE call (Google free
+  endpoint preserves line breaks), splits the reply back onto the blocks
+  (count mismatch → per-block fallback, never a guessed mapping), maps
+  each block rect to full-frame coords via `mapBlockRectToFrame`, and
+  never emits an empty block (an empty translation leaves the English
+  line visible instead of covering it with an empty box).
+- Engine publishes `translationBlocks` (QVariantList of
+  `{original, translated, x, y, w, h}`); the overlay's in-place mode is
+  now a `Repeater` drawing one box per block, padded 8px, exactly over
+  its English line. Subtitle mode joins the live blocks (never
+  `lastTranslatedText`). Full-screen no longer forces subtitle anywhere
+  (engine `setDialoguePreset` + overlay): per-line boxes work for the
+  whole frame.
+- TEST separation: `TranslationJob.testJob` flows through the worker
+  result; `setTestResult` updates only the TEST section's `last*` fields
+  + status — never `hasTranslation`, `translationBlocks`, or
+  `translationReady`. A failed test job also leaves the live overlay
+  alone.
+- Hash cache now stores blocks too, so a repeated identical crop still
+  hits before any OCR/network.
+- New unit tests: `mapBlockRectToFrame`, `blocksToVariantListRoundTrip`,
+  `testJobDoesNotShowOnStream` (engine instance, no network), and
+  `framePumpFiresWhenEnabled` (QSignalSpy, 1s pump). Python mirror 25/25;
+  `npm run locales:check` exit 0 (2326 texts, no new strings).
+
+Still NOT proven live: per-line box positions from real Gemini JSON
+(coordinates are the model's guess), the 1s pump's cost on his HD 4400,
+and the full flow end-to-end. Only Ethan's EliteBook can prove it — the
+overlay lives inside the Windows app on his machine, so no browser
+session (and no login as him) could test it.
+
+## v3 — Custom OpenAI-compatible API + streaming translation (2026-11-12, local commit TBD)
+
+Why: run #34 live test — Gemini answers VERY slowly on Ethan's free key
+(text takes multiple responses to translate). The pipeline is sequential
+(1s pump + 400ms stability + OCR call + translate call), so Gemini free
+tier costs 2–5s per new line. Ethan's ask: keep the Gemini key, ADD a
+custom API — user pastes their own base URL + API key, the model picker
+is fetched live from that base+key, user freely picks a model, PLUS
+streaming for translation with that key. He has a very powerful key in
+mind. Generic for ALL providers, not tied to any one company.
+
+What shipped:
+- `CustomApi.{h,cpp}` (new, pure + testable): `normalizeCustomApiBase`
+  (trims, strips trailing "/", strips a pasted "/chat/completions"),
+  `customApiModelsUrl` / `customApiChatUrl`, `parseCustomApiModels`
+  (GET {base}/models → {"data":[{"id":...}]}, deduped, server order),
+  `parseSseStreamText` (re-parses the ACCUMULATED SSE buffer after
+  every chunk, so a chunk split mid-line still parses; skips "[DONE]",
+  garbage lines, and never double-counts a delta + message in one
+  event), `parseChatCompletionText` (message.content, legacy .text
+  fallback), `buildChatCompletionPayload` (text-only user string, or
+  vision [text part, image_url data: URL] when an image is given).
+- `TranslationHttp::postStream`: synchronous streaming POST with a
+  per-chunk callback; the 8s timeout is INACTIVITY-based (restarts on
+  every chunk) with a 60s hard cap; 429 retries exactly once like
+  `request()`.
+- `TranslationProvider`: new virtual `translateStreaming(text, src, tgt,
+  onChunk)` — default calls `translate()` once and reports the whole
+  text as one chunk, so Google/Gemini work unchanged through the same
+  path. New `CustomApiTranslateProvider` ("custom"): non-stream chat
+  completion for `translate()`, SSE streaming for
+  `translateStreaming()` (emits only growth of the parsed text).
+  Same WuWa system prompt as Gemini (names stay English, Rover
+  pronouns untouched).
+- `OcrEngine`: new `CustomVisionOcrEngine` ("custom-vision"): same
+  blocks-JSON prompt as Gemini Vision over chat/completions with a
+  base64 JPEG data URL. The Gemini envelope parser was split into
+  `parseOcrBlocksJson` (shared) + `parseGeminiOcrText` (envelope only).
+  Opt-in only — default OCR stays gemini-vision; a text-only model
+  chosen for Vision fails honestly (Failed is never retried on another
+  engine).
+- `TranslationWorker`: job carries `CustomApiConfig` (base+key+model);
+  worker keeps a copy via `setCustomApiConfig` (same pattern as the
+  Gemini key). New `jobProgress(original, partial, sourceRect,
+  testJob)` signal, emitted from the streaming callback; new
+  `fetchCustomApiModels(base, key)` slot → `customApiModelsFetched`
+  signal (GET {base}/models, Bearer key).
+- `TranslationEngine`: Q_PROPERTYs `customApiBase`, `customApiModel`,
+  `customApiModels` (QStringList, live-fetched, never persisted) +
+  Q_INVOKABLEs `setCustomApiKey` / `hasCustomApiKey` /
+  `fetchCustomApiModels`. All three config values persist in QSettings
+  under `translation/customApi*` (local only, key never logged, never
+  in the repo). `setPartialTranslation` updates the TEST section or the
+  live overlay (one block over the source rect for now) as chunks
+  arrive; the final `jobCompleted` always replaces the partial, and
+  partials are never cached. Provider list is now
+  google/gemini/custom; OCR list adds custom-vision.
+- Settings page: "Dịch bằng" gains "API tùy chỉnh" (custom), OCR
+  gains "API tùy chỉnh (Vision)". New CUSTOM API panel: Base URL
+  field (saved on editingFinished; the fetch button commits it first),
+  API key field + "Lưu key" (password, never shown back), "Lấy danh
+  sách model" button, Model dropdown fed by the fetched list (falls
+  back to the saved model, or "Chưa lấy danh sách"). Descriptions
+  point at the panel when custom is selected but not configured.
+  `locales:check` exit 0 (2343 texts, 17 new strings in
+  `translation.qmlSource`).
+- Tests: 6 new C++ slots (base normalization, models parsing, SSE
+  parsing incl. mid-line split, chat-completion parsing, payload
+  shape incl. vision, custom factory + isConfigured). Python mirror
+  extended with the same cases (44 checks, 0 failures).
+
+Still NOT proven live: the whole custom-API flow end to end on his
+EliteBook — fetching a real model list from his key's base, picking a
+model, streaming translation showing progressively, and custom Vision
+OCR with a vision-capable model. Only Ethan's key + machine can prove
+it; the sandbox has no key and no Windows build.
+
+Run #41 (gh-runners @ aa2db33) FAILED 11:08 — both Windows jobs, same
+cause: `tst_translation.cpp` used `QJsonArray` with no
+`#include <QJsonArray>` (C2079 on MSVC, lines 387/399). App code
+compiled; only the new test file failed. Fix: add the include (plus
+`<QStringList>` as the same class of insurance) and re-dispatch.
+
+## v4 — Chunk mode + white frosted overlay (2026-11-12, local, NOT dispatched yet)
+
+Translation batch finished 2026-11-12 14:47: 54/55 chunks PASSED (0
+semantic flags) + chunk 043 partial (1,000/4,000, valid JSON) merged by
+merge_vi.py → vi_multi_38.json: 338,677/342,381 entries translated
+(98.92%); 3,704 entries still English, all from chunk 043's remaining
+3,000 strings. A finisher is translating those 3,000 strings in parallel
+(100-item slices); if it passes before the chunk-repo upload, re-run
+gen_client_chunks.py and the manifest counts refresh. Client chunk files
+(55 × {"version":1,"entries":{en:vi}}, ~43 MB, largest 1.9 MB) generated
+by gen_client_chunks.py into ~/workspace/wuwa-vi-translation/client_chunks/
++ manifest.json (game 3.8, 213,384/216,384 strings, 3,042,056/3,133,145
+words). Upload to huyzoz/wuwa-vi-chunks (browser only, 2 commits: root
+manifest+README, chunks/ 55 files) is in progress.
+
+Client changes (this branch, local commit pending):
+- WuWaDialogueDb: loadChunkFile() merges chunk files without clearing;
+  lookupFuzzy() = exact → squashed-form exact → Levenshtein ratio >= 0.88
+  among entries sharing the first two words (first-two-words + squashed
+  indexes, rebuilt on load; O(1) squashed lookup, tiny candidate sets).
+  clear() added. similarityRatio() is a pure two-row Levenshtein.
+- TranslationWorker: chunk DB pointer + enabled flag (queued slots);
+  processNext looks every OCR block up in the DB first (exact, then
+  fuzzy); only misses go to the provider (joined call, same split-back
+  + per-block fallback as before, merged into reading order); all-hit
+  jobs create NO provider at all (translateMs = 0, chunkHit = true).
+  Partials suppressed when any line already came from the DB.
+  startChunkDownload() GETs the manifest, then each listed file one per
+  event-loop turn (queued self-invocation) so jobs keep running between
+  downloads; files land in <cache>/<game>/<version>/ + manifest.json.
+- TranslationEngine: chunk Q_PROPERTYs (chunkEnabled/chunkGame/chunkGames/
+  chunkGameTitle/chunkGameVersion/chunkGameWordsText/chunkGameStringsText/
+  chunkTranslatedText/chunkRepoUrl/chunkStatus/chunkProgress/chunkDbSize/
+  lastChunkHit), persisted in QSettings translation/chunkEnabled|Game
+  (never ShellStore). downloadChunks() → worker; onChunkDownloadFinished
+  reloads the DB from the cache. requestTestTranslation checks the chunk
+  DB first. Coordinate memory: a line whose OCR rect agrees twice
+  (tolerance 0.02) snaps later jitter back to the stored rect (placement
+  only, capped at 200 lines). Bundled Be Vietnam Pro (Regular/Medium/
+  SemiBold/Bold, OFL) loaded via QFontDatabase in the ctor; resource
+  block /fonts added to Resources.cmake.
+- Overlay: TranslationBox is now WHITE frosted glass — live blur of the
+  video behind it (ShaderEffectSource + MultiEffect blur+mask, rounded
+  corners) under a white tint, dark #1a1a2e text in Be Vietnam Pro.
+  No video item → plain translucent white box (never black). Status pill
+  is white too, and shows "Chunk hit" when the last translation came
+  from the DB. DesktopStreamScreen passes videoItem: streamVideo.
+- Settings: new CHUNK panel (after CUSTOM API): Dịch Chunk toggle,
+  Game choice (only Wuthering Waves now, built as a list), detail rows
+  (version, translated count, words, status, Download button, GitHub
+  link via Qt.openUrlExternally). 14 new strings in locales/en.json
+  (2357 texts, locales:check exit 0).
+- Tests: 3 new C++ slots (chunk merge without clearing + missing/invalid
+  file handling, clear(), fuzzy lookup incl. typo/punctuation/no-match
+  + similarityRatio units) and 9 new python-mirror checks (53 checks,
+  0 failures). No new C++ files, so Sources.cmake/Tests.cmake are
+  untouched; no workflow changes.
+
+Still NOT proven live: chunk download + DB lookup on the real app,
+frosted-blur cost on the HD 4400 (the white base still covers the text
+even if the blur layer fails), glyph rendering of Be Vietnam Pro in the
+overlay, and the chunk-043 remainder (finisher pending). CI is the
+compiler: dispatch on huyzoz gh-runners, watch every 5 min.
+
+## v4.1 — full-screen default + honest chunk state (2026-11-12, live-test failure fix)
+
+Live test of v4 (run #53, Ethan 17:48, 4 screenshots: Terminal/profile,
+Character Voicelines, Quests "A Bouquet for Tomorrow", WavesLine chat):
+NO translation on any screen, no error shown. Code read after the fact
+found the causes — the pipeline itself (frame pump → screenshot → OCR →
+chunk DB → overlay) was wired correctly; the failure was upstream of it:
+
+1. DEFAULT CROP MISSED ALL THE TEXT (main cause). The shipped default
+   preset "wuthering-waves" crops only the bottom dialogue strip
+   (0.05, 0.72, 0.90, 0.24). All four test screens put their text
+   outside that strip (quest description, voicelines, chat bubbles,
+   profile) → OCR returned empty → the engine silently kept the old
+   state. The full-screen preset existed but sat third in the dropdown
+   and Ethan's saved preset was the old default. Fix: default preset
+   is now "full-screen" (whole frame: dialogue, quests, chat, menus);
+   a saved "wuthering-waves" is migrated to "full-screen" once at
+   startup (it was the code default, never a deliberate choice;
+   "generic" is kept as-is, the strip stays selectable in Settings).
+   New pure helper TranslationEngine::migrateDialoguePreset() with a
+   C++ slot + 5 python-mirror checks.
+2. CHUNK STATUS LIED WHEN CHUNK MODE WAS OFF. loadCachedChunks() only
+   ran when chunkEnabled was true, so with the toggle off the panel
+   still read "Chưa tải chunk" after a successful download, and the
+   "Tải chunk" button stayed enabled forever. Fix: cached chunks load
+   on every startup; new chunkDownloaded Q_PROPERTY (DB size > 0);
+   the button shows "Đã tải" and disables once downloaded; the Dịch
+   Chunk toggle description says "Đã tải sẵn cơ sở dữ liệu — bật để
+   dùng…" when the DB is on disk.
+3. SILENT NO-TEXT. An OCR job that found no text left the status at
+   "Translation ready" — indistinguishable from a dead pipeline. Fix:
+   the status now reads "No text in scanned area" when a job returns
+   empty (proves the pump runs and the crop is simply empty).
+
+Also corrected here: the chunk DB is 100% (finisher chunk 043 PASSED
+15:41, vi_multi_38.json 342,381/342,381, chunk repo huyzoz/wuwa-vi-chunks
+manifest 216,384 strings) — the v4 note above saying "chunk-043
+remainder (finisher pending)" is stale.
+
+Changes (6 files, local checks green — python mirror 58 checks 0
+failures, locales:check 2359 texts exit 0): TranslationEngine.h/.cpp,
+DesktopSettingsTranslationPage.qml, locales/en.json (+5 strings, −2
+orphaned: the old preset description and detail), tst_translation.cpp
+(+1 slot), translation_logic_check.py (+5 checks). No new C++ files;
+Sources.cmake/Tests.cmake untouched; no workflow changes.
+
+Still NOT proven live: any translation on the real app (needs the new
+build), chunk download + DB lookup on the real app, frosted-blur cost
+on the HD 4400, glyph rendering. Also still open: Ethan's answers on
+toggle state / saved key / status text from the v4 live test.
+
+## v5 — full A-Z database + mandatory vision key + mandatory chunk download (2026-11-12, Ethan's call 18:01)
+
+Ethan's order: ALL game text A-Z, no key missed — not just main-quest
+dialogue; and a redesign: a vision-model API key (Gemini or custom
+base) is MANDATORY, chunks MUST all download, the AI reads the
+coordinates of every text line on the full screen, the code looks each
+line up in the chunk DB, and the Vietnamese is drawn at those exact
+coordinates. Assessment written back to him first: the loop he
+describes (OCR blocks with coords → DB lookup by text → overlay at
+those coords) ALREADY EXISTS in v4 (+ v4.1 full-screen default). The
+real v5 gaps are DB coverage + mandatory key + mandatory chunks. One
+honest nuance: the DB is keyed by TEXT (textmaps carry no screen
+coordinates); coordinates always come from live OCR at runtime.
+
+A-Z inventory (repo 3.8 tree, all 210 EN text files): 220,764 unique
+strings / 3,206,219 words total. Dialogue done (216,384). Remainder
+only 4,380 unique strings / 73,074 words (multi_text_1sthalf 2,057,
+2ndhalf 800, ItemInfo 794, SubtitleText 242, MapMark 199, ...).
+Prepped as chunks 056 (4,000) + 057 (380), keys u216385..u220764,
+validated zero-overlap with the dialogue set; translation runs in a
+coordinator subagent (same GLOSSARY.md + validate_chunk.py pipeline
+as the dialogue batch, incl. the chunk-043 off-by-one lesson: verify
+each vi matches its OWN en, no *.partial.json left in out/).
+
+Client changes (this commit):
+- Mandatory vision key: new visionKeyConfigured property (Gemini key
+  OR custom-API key; visionKeyChanged emitted from both setters).
+  submitCrop refuses keyless jobs with status "Vision key required —
+  paste a Gemini key or set up Custom API" (hash-cache hits still work
+  keyless — they need no OCR). The "Dịch màn hình" toggle is disabled
+  until a key is saved, with a "Bắt buộc: ..." description.
+- Mandatory chunk download: chunkEnabled defaults to true for fresh
+  installs; ensureChunksDownloaded() (ctor, setEnabled(true),
+  setChunkEnabled(true)) starts the full download whenever chunk mode
+  is on and the DB is not complete. downloadChunks() is guarded by
+  m_chunkDownloading (one download at a time); the flag clears in
+  onChunkDownloadFinished on both paths.
+- chunkDownloaded now means COMPLETE, not just non-empty: new pure
+  helper isChunkDownloadComplete(dbSize, expectedStrings) with a C++
+  slot + 6 python-mirror checks. expectedStrings comes from the
+  cached manifest's translatedStrings (0 = unknown, never complete),
+  so a partial cache keeps the button live for re-download.
+- Catalog numbers updated to the A-Z totals: 3,206,219 words,
+  220,764 strings.
+- Fuzzy matching deliberately UNCHANGED: with ratio 0.88 it already
+  cannot fire on strings shorter than 9 chars (1 edit in 8 chars is
+  0.875), so short UI labels can only hit by exact/squashed match.
+  The "short label" risk was analyzed, not real in the current code.
+
+Changes (6 files): TranslationEngine.h/.cpp,
+DesktopSettingsTranslationPage.qml, locales/en.json (+1 string:
+2360 texts, locales:check exit 0), tst_translation.cpp (+1 slot),
+translation_logic_check.py (+6 checks, 0 failures). No new C++ files;
+Sources.cmake/Tests.cmake untouched; no workflow changes.
+
+Still NOT proven live: anything on the real app (needs the v5 build),
+chunk download + DB lookup on the real app, frosted-blur cost on the
+HD 4400, glyph rendering. SEQUENCING: v4.1 run #59 is still building
+(cron watches it); the v5 upload + dispatch wait until #59 is green.
+The chunk-repo refresh (manifest 57 chunks, 220,764 strings) waits
+for the 056/057 translation to PASS validation.
+
+## v5.1 — fix run #59 moc failure (2026-11-12 ~18:20, same day)
+
+Run #59 (v4.1) FAILED: Package windows-x64, step 25 "Build Qt
+release", exit 1, 18:11:13 +07. The signed-in job log (browser)
+gave the exact first error: tst_translation.cpp(329:1): "Parse
+error at ')'" from Qt moc, target opennow-translation-tests — the
+only compile error in the whole log (1 error, 1 warning; the warning
+was just Node.js 20 deprecated).
+
+Root cause — MY edit mistake, not the feature code: the test file
+defines slots INLINE in the class (no separate declaration list).
+My v4.1 edit that added migrateDialoguePresetCases inserted the new
+slot name as a bare line between dialoguePresetRects() and its "{",
+and the v5 edit did the same for chunkDownloadCompleteCases — so
+three bare "void xxx()" lines piled up with a single body attached
+to the last one. moc chokes on the first ")" (it expects ";" or "{").
+Local checks never caught it: the python mirror and locales:check
+do not compile C++.
+
+Fix (this commit): deleted the two stray bare lines, so each of the
+27 slots is defined exactly once with its own body (verified by
+script: 0 bare headers, 0 duplicates). The v5 tree is dispatched as
+run #60 on top of the fixed v4.1 — run #59 can never go green, so
+waiting for it is pointless; its watch cron is replaced by a #60
+watch.
+
+Note: the catalog card already shows the A-Z totals (3,206,219
+words / 220,764 strings) while the chunk repo still serves 55
+chunks / 216,384 strings until the 056/057 translation lands —
+display-only mismatch for a few days; the download/completeness
+logic reads the SERVER manifest, so it stays correct.
