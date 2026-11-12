@@ -33,15 +33,35 @@ Column {
     // stayed disabled.)
     readonly property bool hasEngine: typeof translationEngine !== "undefined" && translationEngine !== null
     property bool keySaved: false
+    property bool customKeySaved: false
 
     Component.onCompleted: {
-        if (page.hasEngine)
+        if (page.hasEngine) {
             page.keySaved = translationEngine.hasGeminiApiKey()
+            page.customKeySaved = translationEngine.hasCustomApiKey()
+        }
     }
 
     readonly property string ocrEngine: page.hasEngine ? String(translationEngine.ocrEngine || "gemini-vision") : "gemini-vision"
     readonly property string provider: page.hasEngine ? String(translationEngine.translationProvider || "google") : "google"
     readonly property string overlayMode: page.hasEngine ? String(translationEngine.overlayMode || "inplace") : "inplace"
+    // The custom API is usable when base + key + model are all set.
+    readonly property bool customConfigured: page.hasEngine
+        && String(translationEngine.customApiBase || "") !== ""
+        && page.customKeySaved
+        && String(translationEngine.customApiModel || "") !== ""
+    // Model dropdown items: the live list from {base}/models when
+    // fetched, otherwise just the currently saved model (or a hint).
+    readonly property var customModelItems: {
+        const models = page.hasEngine ? (translationEngine.customApiModels || []) : []
+        if (models.length === 0) {
+            const current = page.hasEngine ? String(translationEngine.customApiModel || "") : ""
+            return current !== ""
+                ? [{label: current, value: current}]
+                : [{label: qsTr("Chưa lấy danh sách"), value: ""}]
+        }
+        return models.map(m => ({label: String(m), value: String(m)}))
+    }
 
     // (a) Bật / Tắt
     DesktopSettingsPanel {
@@ -109,10 +129,13 @@ Column {
             width: parent.width; glyph: "monitor"; title: qsTr("OCR engine")
             description: page.ocrEngine === "rapidocr" || page.ocrEngine === "windows-ocr"
                 ? qsTr("Chưa khả dụng trong bản này — sẽ có ở bản sau.")
+                : page.ocrEngine === "custom-vision" && !page.customConfigured
+                ? qsTr("Cần base + key + model — điền ở mục API tùy chỉnh bên dưới.")
                 : qsTr("Engine nhận diện chữ trên màn hình stream.")
             items: [
                 {label: qsTr("Gemini Vision"), value: "gemini-vision", detail: qsTr("Mặc định · cần key Gemini")},
                 {label: qsTr("Tesseract"), value: "tesseract", detail: qsTr("Offline · chạy trên máy")},
+                {label: qsTr("API tùy chỉnh (Vision)"), value: "custom-vision", detail: qsTr("Cần model có vision")},
                 {label: qsTr("RapidOCR"), value: "rapidocr", detail: qsTr("Chưa khả dụng trong bản này")},
                 {label: qsTr("Windows OCR"), value: "windows-ocr", detail: qsTr("Chưa khả dụng trong bản này")}
             ]
@@ -154,10 +177,13 @@ Column {
             width: parent.width; glyph: "globe"; title: qsTr("Dịch bằng")
             description: page.provider === "gemini" && !page.keySaved
                 ? qsTr("Cần key Gemini — chưa có key. Dán key ở dưới.")
+                : page.provider === "custom" && !page.customConfigured
+                ? qsTr("Cần base + key + model — điền ở mục API tùy chỉnh bên dưới.")
                 : qsTr("Dịch vụ dịch bản OCR sang tiếng Việt.")
             items: [
                 {label: qsTr("Google Translate"), value: "google", detail: qsTr("Miễn phí · mặc định")},
-                {label: qsTr("Gemini"), value: "gemini", detail: qsTr("Cần key Gemini")}
+                {label: qsTr("Gemini"), value: "gemini", detail: qsTr("Cần key Gemini")},
+                {label: qsTr("API tùy chỉnh"), value: "custom", detail: qsTr("Base + key riêng · stream")}
             ]
             value: page.provider
             onSelected: value => { if (page.hasEngine) translationEngine.translationProvider = value }
@@ -187,6 +213,85 @@ Column {
                     page.keySaved = translationEngine.hasGeminiApiKey()
                 }
             }
+        }
+    }
+
+    // (d2) API tùy chỉnh — bất kỳ base chuẩn OpenAI nào (OpenAI,
+    // OpenRouter, Groq, DeepSeek, Together, server tự host…). Người dùng
+    // tự dán base + key, bấm lấy danh sách model (ping {base}/models
+    // bằng key đó), rồi chọn model. Dịch chạy stream: chữ hiện dần
+    // trong lúc model còn đang sinh, thay vì đợi cả câu trả xong.
+    DesktopSettingsPanel {
+        width: parent.width; paperStyle: true
+        DesktopSettingsSection { text: qsTr("CUSTOM API") }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "globe"; title: qsTr("Base URL")
+            description: qsTr("Base URL của API chuẩn OpenAI — vd https://api.openai.com/v1")
+            showDivider: false
+            DesktopSettingsField {
+                id: customBaseField
+                objectName: "translationCustomApiBaseField"
+                text: page.hasEngine ? String(translationEngine.customApiBase || "") : ""
+                placeholderText: qsTr("Dán base URL…")
+                Accessible.name: qsTr("Base URL")
+                onEditingFinished: {
+                    if (page.hasEngine) translationEngine.customApiBase = text
+                }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "info"; title: qsTr("API key")
+            description: (page.customKeySaved ? qsTr("Đã lưu key.") : qsTr("Chưa có key.")) + " "
+                + qsTr("Key chỉ lưu trên máy này, không gửi đi đâu khác ngoài base trên.")
+            showDivider: false
+            DesktopSettingsField {
+                id: customKeyField
+                objectName: "translationCustomApiKeyField"
+                echoMode: TextInput.Password
+                placeholderText: qsTr("Dán key API…")
+                Accessible.name: qsTr("API key")
+            }
+            DesktopSettingsButton {
+                objectName: "translationCustomApiKeySaveButton"
+                compact: true
+                enabled: page.hasEngine && customKeyField.text !== ""
+                text: qsTr("Lưu key")
+                onClicked: {
+                    if (!page.hasEngine)
+                        return
+                    translationEngine.setCustomApiKey(customKeyField.text)
+                    customKeyField.text = ""
+                    page.customKeySaved = translationEngine.hasCustomApiKey()
+                }
+            }
+        }
+        DesktopSettingsRow {
+            width: parent.width; paperStyle: true; glyph: "check"; title: qsTr("Lấy danh sách model")
+            description: qsTr("Danh sách model lấy từ /models của base trên, bằng key của bạn. Dùng được với mọi base chuẩn OpenAI (OpenAI, OpenRouter, Groq, DeepSeek…).")
+            showDivider: false
+            DesktopSettingsButton {
+                objectName: "translationCustomApiFetchModelsButton"
+                compact: true
+                enabled: page.hasEngine && customBaseField.text !== "" && page.customKeySaved
+                text: qsTr("Lấy danh sách model")
+                onClicked: {
+                    if (!page.hasEngine)
+                        return
+                    // Commit the base first: it is only saved to the
+                    // engine on editingFinished, and fetch reads it.
+                    translationEngine.customApiBase = customBaseField.text
+                    translationEngine.fetchCustomApiModels()
+                }
+            }
+        }
+        DesktopSettingsChoice {
+            objectName: "translationCustomApiModel"
+            width: parent.width; glyph: "monitor"; title: qsTr("Model")
+            description: qsTr("Model đang dùng để dịch (và OCR nếu chọn Vision).")
+            showDivider: false
+            items: page.customModelItems
+            value: page.hasEngine ? String(translationEngine.customApiModel || "") : ""
+            onSelected: value => { if (page.hasEngine && value !== "") translationEngine.customApiModel = value }
         }
     }
 
