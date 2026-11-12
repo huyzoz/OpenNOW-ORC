@@ -46,6 +46,11 @@ class TranslationEngine : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(bool enabled READ enabled WRITE setEnabled NOTIFY enabledChanged)
+    // v5: live OCR needs a vision model key (Gemini key or custom-API
+    // key). Without one there is no OCR engine that can read the screen,
+    // so the feature refuses to run blind — the Settings toggle stays
+    // locked until a key is saved.
+    Q_PROPERTY(bool visionKeyConfigured READ visionKeyConfigured NOTIFY visionKeyChanged)
     Q_PROPERTY(QString sourceLanguage READ sourceLanguage WRITE setSourceLanguage NOTIFY sourceLanguageChanged)
     Q_PROPERTY(QString targetLanguage READ targetLanguage WRITE setTargetLanguage NOTIFY targetLanguageChanged)
     Q_PROPERTY(QString ocrEngine READ ocrEngine WRITE setOcrEngine NOTIFY ocrEngineChanged)
@@ -185,7 +190,13 @@ public:
     QString chunkStatus() const { return m_chunkStatus; }
     double chunkProgress() const { return m_chunkProgress; }
     int chunkDbSize() const { return m_chunkDb.size(); }
-    bool chunkDownloaded() const { return m_chunkDb.size() > 0; }
+    // True only when the chunk DB on disk holds the full set the
+    // manifest promises (translatedStrings). A partial download is NOT
+    // "downloaded" — the button stays live so it can be re-downloaded.
+    bool chunkDownloaded() const { return isChunkDownloadComplete(m_chunkDb.size(), m_chunkExpectedStrings); }
+    // Pure, unit-testable: complete iff the manifest promises at least
+    // one string and the DB holds at least that many.
+    static bool isChunkDownloadComplete(int dbSize, int expectedStrings);
     bool lastChunkHit() const { return m_lastChunkHit; }
 
     Q_INVOKABLE void onStreamFrame(const QImage &image);
@@ -200,6 +211,10 @@ public:
     Q_INVOKABLE bool hasGeminiApiKey() const;
     Q_INVOKABLE void setCustomApiKey(const QString &key);
     Q_INVOKABLE bool hasCustomApiKey() const;
+    // v5: true when a vision model can actually read the screen — a
+    // Gemini key OR a custom-API key is saved. Either one satisfies the
+    // mandatory-key requirement.
+    bool visionKeyConfigured() const;
     // Lists the models of the configured custom base (GET {base}/models
     // with the saved key). Result arrives via customApiModelsChanged /
     // statusText; the model list itself is never persisted.
@@ -235,6 +250,7 @@ signals:
     void chunkStatusChanged();
     void chunkProgressChanged();
     void chunkDbSizeChanged();
+    void visionKeyChanged();
     // Emitted by the frame pump while translation is enabled. Application
     // Startup connects it to NativeStreamRuntime::requestScreenshot(): the
     // screenshotReady signal only fires for an explicit screenshot request,
@@ -265,6 +281,11 @@ private:
     // into m_chunkDb (no-op when nothing is cached). Also refreshes the
     // detail strings from the cached manifest.
     void loadCachedChunks();
+    // v5: starts the full chunk download when chunk mode is on and the
+    // DB is not complete (and no download is already running). Called
+    // from the ctor, setEnabled, and setChunkEnabled — the download is
+    // mandatory, not something the user has to remember to press.
+    void ensureChunksDownloaded();
     void setChunkStatus(const QString &status);
     // Refreshes the detail-card strings from the shipped-known catalog
     // for the selected game.
@@ -338,6 +359,13 @@ private:
     QString m_chunkStatus;
     double m_chunkProgress = 0.0;
     bool m_lastChunkHit = false;
+    // Expected unique strings, from the cached manifest's
+    // translatedStrings (0 = unknown: no manifest on disk). Together
+    // with m_chunkDb.size() it decides chunkDownloaded().
+    int m_chunkExpectedStrings = 0;
+    // True while a chunk download is running on the worker thread, so a
+    // second ensure/download call cannot start a duplicate download.
+    bool m_chunkDownloading = false;
     // Coordinate memory (v4): normalized English line -> last stable
     // rect + how many consecutive frames agreed with it. A rect that
     // agrees twice is "stable" and later jitter snaps back to it, so

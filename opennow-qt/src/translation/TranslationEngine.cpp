@@ -57,7 +57,7 @@ ChunkGameCatalogEntry chunkCatalogEntry(const QString &id)
         return {id, QStringLiteral("Wuthering Waves"), QStringLiteral("3.8"),
                 QStringLiteral("https://github.com/huyzoz/wuwa-vi-chunks"),
                 QStringLiteral("https://raw.githubusercontent.com/huyzoz/wuwa-vi-chunks/main/manifest.json"),
-                3133145, 216384};
+                3206219, 220764};
     return {};
 }
 
@@ -173,7 +173,7 @@ TranslationEngine::TranslationEngine(QObject *parent)
         m_fontSizePx = settings.value(QStringLiteral("translation/fontSizePx"), 22).toInt();
         m_showOriginal = settings.value(QStringLiteral("translation/showOriginal"), false).toBool();
         m_cacheEnabled = settings.value(QStringLiteral("translation/cacheEnabled"), true).toBool();
-        m_chunkEnabled = settings.value(QStringLiteral("translation/chunkEnabled"), false).toBool();
+        m_chunkEnabled = settings.value(QStringLiteral("translation/chunkEnabled"), true).toBool();
         m_chunkGame = settings.value(QStringLiteral("translation/chunkGame"),
                                      QStringLiteral("wuthering-waves")).toString();
         m_dialoguePreset = settings.value(QStringLiteral("translation/dialoguePreset"),
@@ -239,6 +239,10 @@ TranslationEngine::TranslationEngine(QObject *parent)
     QMetaObject::invokeMethod(m_worker, "setChunkEnabled", Qt::QueuedConnection,
                               Q_ARG(bool, m_chunkEnabled));
     loadCachedChunks();
+    // v5: the chunk download is mandatory — if chunk mode is on and the
+    // DB is not complete, start the full download now instead of
+    // waiting for the user to press "Tải chunk".
+    ensureChunksDownloaded();
     // The pump was restored enabled from QSettings: start it. The
     // frameRequested connect in ApplicationStartup is wired after this
     // constructor returns, and the first timeout is 1s away, so no
@@ -297,6 +301,7 @@ void TranslationEngine::setEnabled(bool enabled)
         m_worker->cancelPending();
     } else {
         m_frameTimer.start();
+        ensureChunksDownloaded();
     }
     setStatus(m_enabled ? QStringLiteral("Translation enabled")
                         : QStringLiteral("Translation disabled"));
@@ -391,11 +396,20 @@ void TranslationEngine::setCustomApiKey(const QString &key)
     else
         settings.setValue(QStringLiteral("translation/customApiKey"), key);
     syncCustomApiToWorker();
+    emit visionKeyChanged();
 }
 
 bool TranslationEngine::hasCustomApiKey() const
 {
     return !m_customApiKey.isEmpty();
+}
+
+bool TranslationEngine::visionKeyConfigured() const
+{
+    // v5: a vision model key is mandatory for live OCR — a Gemini key
+    // OR a custom-API key. Either one satisfies the requirement; with
+    // neither, submitCrop refuses to run blind (see below).
+    return hasGeminiApiKey() || hasCustomApiKey();
 }
 
 void TranslationEngine::fetchCustomApiModels()
@@ -495,6 +509,7 @@ void TranslationEngine::setChunkEnabled(bool enabled)
     if (enabled) {
         if (m_chunkDb.size() == 0)
             loadCachedChunks();
+        ensureChunksDownloaded();
     } else {
         setChunkStatus(QStringLiteral("Chunk mode off"));
     }
@@ -515,8 +530,16 @@ void TranslationEngine::setChunkGame(const QString &game)
 
 void TranslationEngine::downloadChunks()
 {
+    // One download at a time: ensureChunksDownloaded, the Settings
+    // button, and a second call while the worker is still fetching must
+    // not start a duplicate download (the worker would reset its file
+    // list mid-download).
+    if (m_chunkDownloading)
+        return;
+    m_chunkDownloading = true;
     const ChunkGameCatalogEntry entry = chunkCatalogEntry(m_chunkGame);
     if (entry.manifestUrl.isEmpty()) {
+        m_chunkDownloading = false;
         setError(QStringLiteral("No chunks for this game"));
         return;
     }
@@ -536,9 +559,26 @@ void TranslationEngine::setChunkStatus(const QString &status)
     emit chunkStatusChanged();
 }
 
+void TranslationEngine::ensureChunksDownloaded()
+{
+    if (!m_chunkEnabled || chunkDownloaded() || m_chunkDownloading)
+        return;
+    downloadChunks();
+}
+
+bool TranslationEngine::isChunkDownloadComplete(int dbSize, int expectedStrings)
+{
+    // Complete iff the manifest promises at least one string and the DB
+    // holds at least that many. expectedStrings == 0 means "unknown"
+    // (no manifest on disk) — never complete, so the download stays
+    // available instead of claiming "Đã tải" on a partial cache.
+    return expectedStrings > 0 && dbSize >= expectedStrings;
+}
+
 void TranslationEngine::loadCachedChunks()
 {
     const QString base = chunkGameCacheBase();
+    m_chunkExpectedStrings = 0;
     QDir dir(base);
     const QStringList versions = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
     if (versions.isEmpty()) {
@@ -556,6 +596,8 @@ void TranslationEngine::loadCachedChunks()
             const QJsonObject manifest = doc.object();
             const int translated = manifest.value(QStringLiteral("translatedStrings")).toInt();
             const int total = manifest.value(QStringLiteral("uniqueStrings")).toInt();
+            if (translated > 0)
+                m_chunkExpectedStrings = translated;
             const QLocale vi(QStringLiteral("vi_VN"));
             if (translated > 0 && total > 0)
                 m_chunkTranslatedText = QStringLiteral("Đã dịch %1 / %2 câu")
@@ -596,6 +638,7 @@ void TranslationEngine::onChunkDownloadProgress(int done, int total)
 
 void TranslationEngine::onChunkDownloadFinished(const QString &error)
 {
+    m_chunkDownloading = false;
     m_chunkProgress = error.isEmpty() ? 1.0 : 0.0;
     emit chunkProgressChanged();
     if (!error.isEmpty()) {
@@ -713,6 +756,7 @@ void TranslationEngine::setGeminiApiKey(const QString &key)
         settings.setValue(QStringLiteral("translation/geminiApiKey"), key);
     QMetaObject::invokeMethod(m_worker, "setGeminiApiKey", Qt::QueuedConnection,
                               Q_ARG(QString, key));
+    emit visionKeyChanged();
 }
 
 bool TranslationEngine::hasGeminiApiKey() const
@@ -778,6 +822,16 @@ void TranslationEngine::submitCrop(const QImage &crop, const QString &hash, cons
             emitTranslation(hit->original, hit->translated, rect, 0, 0, true, hit->blocks);
             return;
         }
+    }
+
+    // v5: live OCR needs a vision model key (Gemini or custom API).
+    // Without one there is no OCR engine that can read the screen, so
+    // refuse here with a plain status instead of submitting jobs that
+    // fail in the worker with a generic error. (Hash-cache hits above
+    // need no OCR, so they still work keyless.)
+    if (!visionKeyConfigured()) {
+        setStatus(QStringLiteral("Vision key required — paste a Gemini key or set up Custom API"));
+        return;
     }
 
     TranslationJob job;
