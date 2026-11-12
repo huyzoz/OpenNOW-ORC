@@ -457,3 +457,80 @@ Still NOT proven live: per-line box positions from real Gemini JSON
 and the full flow end-to-end. Only Ethan's EliteBook can prove it — the
 overlay lives inside the Windows app on his machine, so no browser
 session (and no login as him) could test it.
+
+## v3 — Custom OpenAI-compatible API + streaming translation (2026-11-12, local commit TBD)
+
+Why: run #34 live test — Gemini answers VERY slowly on Ethan's free key
+(text takes multiple responses to translate). The pipeline is sequential
+(1s pump + 400ms stability + OCR call + translate call), so Gemini free
+tier costs 2–5s per new line. Ethan's ask: keep the Gemini key, ADD a
+custom API — user pastes their own base URL + API key, the model picker
+is fetched live from that base+key, user freely picks a model, PLUS
+streaming for translation with that key. He has a very powerful key in
+mind. Generic for ALL providers, not tied to any one company.
+
+What shipped:
+- `CustomApi.{h,cpp}` (new, pure + testable): `normalizeCustomApiBase`
+  (trims, strips trailing "/", strips a pasted "/chat/completions"),
+  `customApiModelsUrl` / `customApiChatUrl`, `parseCustomApiModels`
+  (GET {base}/models → {"data":[{"id":...}]}, deduped, server order),
+  `parseSseStreamText` (re-parses the ACCUMULATED SSE buffer after
+  every chunk, so a chunk split mid-line still parses; skips "[DONE]",
+  garbage lines, and never double-counts a delta + message in one
+  event), `parseChatCompletionText` (message.content, legacy .text
+  fallback), `buildChatCompletionPayload` (text-only user string, or
+  vision [text part, image_url data: URL] when an image is given).
+- `TranslationHttp::postStream`: synchronous streaming POST with a
+  per-chunk callback; the 8s timeout is INACTIVITY-based (restarts on
+  every chunk) with a 60s hard cap; 429 retries exactly once like
+  `request()`.
+- `TranslationProvider`: new virtual `translateStreaming(text, src, tgt,
+  onChunk)` — default calls `translate()` once and reports the whole
+  text as one chunk, so Google/Gemini work unchanged through the same
+  path. New `CustomApiTranslateProvider` ("custom"): non-stream chat
+  completion for `translate()`, SSE streaming for
+  `translateStreaming()` (emits only growth of the parsed text).
+  Same WuWa system prompt as Gemini (names stay English, Rover
+  pronouns untouched).
+- `OcrEngine`: new `CustomVisionOcrEngine` ("custom-vision"): same
+  blocks-JSON prompt as Gemini Vision over chat/completions with a
+  base64 JPEG data URL. The Gemini envelope parser was split into
+  `parseOcrBlocksJson` (shared) + `parseGeminiOcrText` (envelope only).
+  Opt-in only — default OCR stays gemini-vision; a text-only model
+  chosen for Vision fails honestly (Failed is never retried on another
+  engine).
+- `TranslationWorker`: job carries `CustomApiConfig` (base+key+model);
+  worker keeps a copy via `setCustomApiConfig` (same pattern as the
+  Gemini key). New `jobProgress(original, partial, sourceRect,
+  testJob)` signal, emitted from the streaming callback; new
+  `fetchCustomApiModels(base, key)` slot → `customApiModelsFetched`
+  signal (GET {base}/models, Bearer key).
+- `TranslationEngine`: Q_PROPERTYs `customApiBase`, `customApiModel`,
+  `customApiModels` (QStringList, live-fetched, never persisted) +
+  Q_INVOKABLEs `setCustomApiKey` / `hasCustomApiKey` /
+  `fetchCustomApiModels`. All three config values persist in QSettings
+  under `translation/customApi*` (local only, key never logged, never
+  in the repo). `setPartialTranslation` updates the TEST section or the
+  live overlay (one block over the source rect for now) as chunks
+  arrive; the final `jobCompleted` always replaces the partial, and
+  partials are never cached. Provider list is now
+  google/gemini/custom; OCR list adds custom-vision.
+- Settings page: "Dịch bằng" gains "API tùy chỉnh" (custom), OCR
+  gains "API tùy chỉnh (Vision)". New CUSTOM API panel: Base URL
+  field (saved on editingFinished; the fetch button commits it first),
+  API key field + "Lưu key" (password, never shown back), "Lấy danh
+  sách model" button, Model dropdown fed by the fetched list (falls
+  back to the saved model, or "Chưa lấy danh sách"). Descriptions
+  point at the panel when custom is selected but not configured.
+  `locales:check` exit 0 (2343 texts, 17 new strings in
+  `translation.qmlSource`).
+- Tests: 6 new C++ slots (base normalization, models parsing, SSE
+  parsing incl. mid-line split, chat-completion parsing, payload
+  shape incl. vision, custom factory + isConfigured). Python mirror
+  extended with the same cases (44 checks, 0 failures).
+
+Still NOT proven live: the whole custom-API flow end to end on his
+EliteBook — fetching a real model list from his key's base, picking a
+model, streaming translation showing progressively, and custom Vision
+OCR with a vision-capable model. Only Ethan's key + machine can prove
+it; the sandbox has no key and no Windows build.
