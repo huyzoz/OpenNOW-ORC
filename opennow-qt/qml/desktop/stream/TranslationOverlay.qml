@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import OpenNOW
 
 // Translation overlay: renders the live EN -> VI translation above the stream
@@ -21,6 +22,9 @@ Item {
 
     readonly property bool hasEngine: typeof translationEngine !== "undefined" && translationEngine !== null
     readonly property bool engineOn: root.hasEngine && translationEngine.enabled
+    // The stream video item (set by DesktopStreamScreen). The frosted
+    // box blurs the video behind it; null keeps the plain white box.
+    property Item videoItem: null
     readonly property bool hasText: root.hasEngine && translationEngine.hasTranslation
     // One entry per translated line: {original, translated, x, y, w, h}
     // with x/y/w/h normalized 0..1 in full-frame coordinates. In-place
@@ -54,23 +58,63 @@ Item {
         const ocr = Number(translationEngine.lastOcrMs || 0)
         const tr = Number(translationEngine.lastTranslateMs || 0)
         let text = qsTr("OCR %1ms · Dịch %2ms").arg(ocr).arg(tr)
-        if (translationEngine.lastCacheHit === true)
+        if (translationEngine.lastChunkHit === true)
+            text += " · " + qsTr("Chunk hit")
+        else if (translationEngine.lastCacheHit === true)
             text += " · " + qsTr("Cache hit")
         return text
     }
 
-    // One box shape for both modes: semi-transparent dark background, white
-    // wrapped text that shrinks (never overflows the box), optional small
-    // original underneath.
-    component TranslationBox: Rectangle {
+    // One box shape for both modes: WHITE frosted glass (khảm trắng) —
+    // a live blur of the video behind it under a white tint, dark text
+    // in Be Vietnam Pro (bundled, full Vietnamese diacritics). NEVER a
+    // black box: when there is no video item to blur, the box is plain
+    // translucent white instead, so the English line is always covered
+    // by white, never by black.
+    component TranslationBox: Item {
         id: box
         required property string translated
         required property string original
         required property bool showOriginalText
         required property int baseFontSize
-        color: "black"
-        opacity: 0.85
-        radius: DesktopTokens.px(12)
+        readonly property int cornerRadius: DesktopTokens.px(12)
+        // (1) Blurred video behind, clipped to the rounded rect. The
+        // source rect is in video-item coordinates; the overlay and the
+        // video item both fill the same parent, so the coordinates match.
+        Item {
+            id: blurLayer
+            anchors.fill: parent
+            visible: root.videoItem !== null
+            layer.enabled: true
+            layer.effect: MultiEffect {
+                maskEnabled: true
+                maskSource: blurMask
+                blurEnabled: true
+                blurMax: 24
+                blur: 0.55
+            }
+            ShaderEffectSource {
+                anchors.fill: parent
+                sourceItem: root.videoItem
+                sourceRect: Qt.rect(box.x, box.y, box.width, box.height)
+                live: true
+            }
+        }
+        Rectangle {
+            id: blurMask
+            anchors.fill: parent
+            radius: box.cornerRadius
+            color: "white"
+            visible: false
+        }
+        // (2) White tint over the blur (or the whole background when
+        // there is no video to blur).
+        Rectangle {
+            anchors.fill: parent
+            radius: box.cornerRadius
+            color: "white"
+            opacity: root.videoItem !== null ? 0.55 : 0.88
+        }
         Column {
             anchors.fill: parent
             anchors.margins: DesktopTokens.px(12)
@@ -80,9 +124,10 @@ Item {
                 width: parent.width
                 height: parent.height - (originalLabel.visible ? originalLabel.height + parent.spacing : 0)
                 text: box.translated
-                color: "white"
-                font.family: Theme.bodyFont
+                color: "#1a1a2e"
+                font.family: "Be Vietnam Pro"
                 font.pixelSize: box.baseFontSize
+                font.weight: Font.Medium
                 fontSizeMode: Text.Fit
                 minimumPixelSize: 12
                 wrapMode: Text.WordWrap
@@ -94,8 +139,8 @@ Item {
                 visible: box.showOriginalText && box.original !== ""
                 width: parent.width
                 text: box.original
-                color: Qt.rgba(1, 1, 1, 0.65)
-                font.family: Theme.bodyFont
+                color: Qt.rgba(0.10, 0.10, 0.18, 0.65)
+                font.family: "Be Vietnam Pro"
                 font.pixelSize: Math.max(11, Math.round(box.baseFontSize * 0.6))
                 wrapMode: Text.WordWrap
                 elide: Text.ElideRight
@@ -166,8 +211,8 @@ Item {
         width: statusLabel.implicitWidth + DesktopTokens.px(20)
         height: DesktopTokens.px(24)
         radius: height / 2
-        color: "black"
-        opacity: 0.7
+        color: "white"
+        opacity: 0.85
         x: Math.max(0, root.width - width - DesktopTokens.px(16))
         y: root.mode === "inplace"
             ? Math.max(0, root.topBlockY - height - DesktopTokens.px(6))
@@ -176,7 +221,7 @@ Item {
             id: statusLabel
             anchors.centerIn: parent
             text: root.timingText
-            color: "white"
+            color: "#1a1a2e"
             font.family: Theme.monoFont
             font.pixelSize: DesktopTokens.px(11)
         }

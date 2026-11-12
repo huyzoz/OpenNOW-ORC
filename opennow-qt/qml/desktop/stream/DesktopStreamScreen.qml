@@ -171,6 +171,7 @@ FocusScope {
     TranslationOverlay {
         anchors.fill: parent
         z: 6
+        videoItem: streamVideo
     }
 
     Timer {
