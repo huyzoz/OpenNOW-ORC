@@ -327,6 +327,7 @@ private slots:
     }
 
     void dialoguePresetRects()
+    void migrateDialoguePresetCases()
     {
         QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("wuthering-waves")),
                  QRectF(0.05, 0.72, 0.90, 0.24));
@@ -337,6 +338,24 @@ private slots:
         QCOMPARE(TranslationEngine::dialogueRectForPreset(QStringLiteral("full-screen")),
                  QRectF(0, 0, 1, 1));
         QVERIFY(TranslationEngine::dialogueRectForPreset(QStringLiteral("bogus")).isNull());
+    }
+
+    void migrateDialoguePresetCases()
+    {
+        // v4.1: the old shipped default ("wuthering-waves", dialogue strip
+        // only) migrates to full-screen, because it missed almost all
+        // game text. A deliberate "generic" choice stays; empty and
+        // unknown values become the current default, full-screen.
+        QCOMPARE(TranslationEngine::migrateDialoguePreset(QStringLiteral("wuthering-waves")),
+                 QStringLiteral("full-screen"));
+        QCOMPARE(TranslationEngine::migrateDialoguePreset(QStringLiteral("generic")),
+                 QStringLiteral("generic"));
+        QCOMPARE(TranslationEngine::migrateDialoguePreset(QStringLiteral("full-screen")),
+                 QStringLiteral("full-screen"));
+        QCOMPARE(TranslationEngine::migrateDialoguePreset(QString()),
+                 QStringLiteral("full-screen"));
+        QCOMPARE(TranslationEngine::migrateDialoguePreset(QStringLiteral("bogus")),
+                 QStringLiteral("full-screen"));
     }
 
     void mapBlockRectToFrameCases()

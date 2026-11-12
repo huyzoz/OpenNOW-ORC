@@ -59,6 +59,15 @@ def dialogue_rect_for_preset(preset):
     return None
 
 
+def migrate_dialogue_preset(saved):
+    # Mirrors TranslationEngine::migrateDialoguePreset (v4.1): the old
+    # shipped default "wuthering-waves" becomes "full-screen"; "generic"
+    # and "full-screen" pass through; empty/unknown become "full-screen".
+    if saved in ("generic", "full-screen"):
+        return saved
+    return "full-screen"
+
+
 def map_block_rect_to_frame(block, source):
     # Mirrors mapBlockRectToFrame: an OCR block's rect (0..1 within the
     # crop) into full-frame coords through the crop's source rect, clamped.
@@ -323,6 +332,18 @@ def main():
           dialogue_rect_for_preset("full-screen") == (0, 0, 1, 1))
     check("preset unknown -> None",
           dialogue_rect_for_preset("bogus") is None)
+
+    # v4.1 preset migration mirrors TranslationEngine::migrateDialoguePreset.
+    check("migrate old default wuthering-waves -> full-screen",
+          migrate_dialogue_preset("wuthering-waves") == "full-screen")
+    check("migrate generic stays generic",
+          migrate_dialogue_preset("generic") == "generic")
+    check("migrate full-screen stays full-screen",
+          migrate_dialogue_preset("full-screen") == "full-screen")
+    check("migrate empty -> full-screen",
+          migrate_dialogue_preset("") == "full-screen")
+    check("migrate unknown -> full-screen",
+          migrate_dialogue_preset("bogus") == "full-screen")
 
     # 2b. Block rect mapping mirrors mapBlockRectToFrame (v2 per-line overlay).
     def near(a, b):
