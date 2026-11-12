@@ -13,7 +13,7 @@
 #include <QStandardPaths>
 
 namespace {
-constexpr auto GeminiModel = "gemini-2.5-flash-lite";
+constexpr auto GeminiModel = "gemini-3.5-flash-lite";
 // The model must return one block PER LINE, with the block's position in
 // the image — the overlay draws one Vietnamese box over each English line,
 // so coordinates are the whole point. x/y/w/h are fractions of the image
