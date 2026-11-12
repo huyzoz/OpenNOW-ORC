@@ -534,3 +534,9 @@ EliteBook — fetching a real model list from his key's base, picking a
 model, streaming translation showing progressively, and custom Vision
 OCR with a vision-capable model. Only Ethan's key + machine can prove
 it; the sandbox has no key and no Windows build.
+
+Run #41 (gh-runners @ aa2db33) FAILED 11:08 — both Windows jobs, same
+cause: `tst_translation.cpp` used `QJsonArray` with no
+`#include <QJsonArray>` (C2079 on MSVC, lines 387/399). App code
+compiled; only the new test file failed. Fix: add the include (plus
+`<QStringList>` as the same class of insurance) and re-dispatch.
