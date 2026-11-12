@@ -386,6 +386,7 @@ if(BUILD_TESTING)
         src/translation/TranslationCache.cpp src/translation/TranslationCache.h
         src/translation/WuWaDialogueDb.cpp src/translation/WuWaDialogueDb.h
         src/translation/TranslationHttp.cpp src/translation/TranslationHttp.h
+        src/translation/CustomApi.cpp src/translation/CustomApi.h
         src/translation/OcrEngine.cpp src/translation/OcrEngine.h
         src/translation/TranslationProvider.cpp src/translation/TranslationProvider.h
         src/translation/TranslationWorker.cpp src/translation/TranslationWorker.h
