@@ -655,3 +655,97 @@ Still NOT proven live: any translation on the real app (needs the new
 build), chunk download + DB lookup on the real app, frosted-blur cost
 on the HD 4400, glyph rendering. Also still open: Ethan's answers on
 toggle state / saved key / status text from the v4 live test.
+
+## v5 — full A-Z database + mandatory vision key + mandatory chunk download (2026-11-12, Ethan's call 18:01)
+
+Ethan's order: ALL game text A-Z, no key missed — not just main-quest
+dialogue; and a redesign: a vision-model API key (Gemini or custom
+base) is MANDATORY, chunks MUST all download, the AI reads the
+coordinates of every text line on the full screen, the code looks each
+line up in the chunk DB, and the Vietnamese is drawn at those exact
+coordinates. Assessment written back to him first: the loop he
+describes (OCR blocks with coords → DB lookup by text → overlay at
+those coords) ALREADY EXISTS in v4 (+ v4.1 full-screen default). The
+real v5 gaps are DB coverage + mandatory key + mandatory chunks. One
+honest nuance: the DB is keyed by TEXT (textmaps carry no screen
+coordinates); coordinates always come from live OCR at runtime.
+
+A-Z inventory (repo 3.8 tree, all 210 EN text files): 220,764 unique
+strings / 3,206,219 words total. Dialogue done (216,384). Remainder
+only 4,380 unique strings / 73,074 words (multi_text_1sthalf 2,057,
+2ndhalf 800, ItemInfo 794, SubtitleText 242, MapMark 199, ...).
+Prepped as chunks 056 (4,000) + 057 (380), keys u216385..u220764,
+validated zero-overlap with the dialogue set; translation runs in a
+coordinator subagent (same GLOSSARY.md + validate_chunk.py pipeline
+as the dialogue batch, incl. the chunk-043 off-by-one lesson: verify
+each vi matches its OWN en, no *.partial.json left in out/).
+
+Client changes (this commit):
+- Mandatory vision key: new visionKeyConfigured property (Gemini key
+  OR custom-API key; visionKeyChanged emitted from both setters).
+  submitCrop refuses keyless jobs with status "Vision key required —
+  paste a Gemini key or set up Custom API" (hash-cache hits still work
+  keyless — they need no OCR). The "Dịch màn hình" toggle is disabled
+  until a key is saved, with a "Bắt buộc: ..." description.
+- Mandatory chunk download: chunkEnabled defaults to true for fresh
+  installs; ensureChunksDownloaded() (ctor, setEnabled(true),
+  setChunkEnabled(true)) starts the full download whenever chunk mode
+  is on and the DB is not complete. downloadChunks() is guarded by
+  m_chunkDownloading (one download at a time); the flag clears in
+  onChunkDownloadFinished on both paths.
+- chunkDownloaded now means COMPLETE, not just non-empty: new pure
+  helper isChunkDownloadComplete(dbSize, expectedStrings) with a C++
+  slot + 6 python-mirror checks. expectedStrings comes from the
+  cached manifest's translatedStrings (0 = unknown, never complete),
+  so a partial cache keeps the button live for re-download.
+- Catalog numbers updated to the A-Z totals: 3,206,219 words,
+  220,764 strings.
+- Fuzzy matching deliberately UNCHANGED: with ratio 0.88 it already
+  cannot fire on strings shorter than 9 chars (1 edit in 8 chars is
+  0.875), so short UI labels can only hit by exact/squashed match.
+  The "short label" risk was analyzed, not real in the current code.
+
+Changes (6 files): TranslationEngine.h/.cpp,
+DesktopSettingsTranslationPage.qml, locales/en.json (+1 string:
+2360 texts, locales:check exit 0), tst_translation.cpp (+1 slot),
+translation_logic_check.py (+6 checks, 0 failures). No new C++ files;
+Sources.cmake/Tests.cmake untouched; no workflow changes.
+
+Still NOT proven live: anything on the real app (needs the v5 build),
+chunk download + DB lookup on the real app, frosted-blur cost on the
+HD 4400, glyph rendering. SEQUENCING: v4.1 run #59 is still building
+(cron watches it); the v5 upload + dispatch wait until #59 is green.
+The chunk-repo refresh (manifest 57 chunks, 220,764 strings) waits
+for the 056/057 translation to PASS validation.
+
+## v5.1 — fix run #59 moc failure (2026-11-12 ~18:20, same day)
+
+Run #59 (v4.1) FAILED: Package windows-x64, step 25 "Build Qt
+release", exit 1, 18:11:13 +07. The signed-in job log (browser)
+gave the exact first error: tst_translation.cpp(329:1): "Parse
+error at ')'" from Qt moc, target opennow-translation-tests — the
+only compile error in the whole log (1 error, 1 warning; the warning
+was just Node.js 20 deprecated).
+
+Root cause — MY edit mistake, not the feature code: the test file
+defines slots INLINE in the class (no separate declaration list).
+My v4.1 edit that added migrateDialoguePresetCases inserted the new
+slot name as a bare line between dialoguePresetRects() and its "{",
+and the v5 edit did the same for chunkDownloadCompleteCases — so
+three bare "void xxx()" lines piled up with a single body attached
+to the last one. moc chokes on the first ")" (it expects ";" or "{").
+Local checks never caught it: the python mirror and locales:check
+do not compile C++.
+
+Fix (this commit): deleted the two stray bare lines, so each of the
+27 slots is defined exactly once with its own body (verified by
+script: 0 bare headers, 0 duplicates). The v5 tree is dispatched as
+run #60 on top of the fixed v4.1 — run #59 can never go green, so
+waiting for it is pointless; its watch cron is replaced by a #60
+watch.
+
+Note: the catalog card already shows the A-Z totals (3,206,219
+words / 220,764 strings) while the chunk repo still serves 55
+chunks / 216,384 strings until the 056/057 translation lands —
+display-only mismatch for a few days; the download/completeness
+logic reads the SERVER manifest, so it stays correct.
